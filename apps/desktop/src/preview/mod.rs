@@ -12,32 +12,26 @@ use crate::VisualSource;
 use tracing::trace;
 
 pub(crate) fn visual_source_at(graph: &TimelineGraph, playhead: i64) -> Option<VisualSource> {
-    for binding in graph.tracks.iter().rev() {
+    // Priority: lower-numbered tracks first (top-most rows in UI)
+    for binding in graph.tracks.iter() {
         if matches!(binding.kind, TrackKind::Audio) {
             continue;
         }
         for node_id in binding.node_ids.iter() {
-            let node = graph.nodes.get(node_id)?;
-            let Some(range) = node_frame_range(node) else {
-                continue;
-            };
-            if playhead < range.start || playhead >= range.end() {
-                continue;
-            }
+            // Skip missing nodes instead of aborting the entire search.
+            let Some(node) = graph.nodes.get(node_id) else { continue };
+            let Some(range) = node_frame_range(node) else { continue };
+            if playhead < range.start || playhead >= range.end() { continue; }
             match &node.kind {
                 TimelineNodeKind::Clip(clip) => {
                     let asset = clip.asset_id.as_deref().unwrap_or("<unknown>");
                     trace!(node_id = ?node_id, asset, playhead, "preview resolver matched clip");
-                    return clip_source(binding, clip);
-                }
-                TimelineNodeKind::Generator {
-                    generator_id,
-                    metadata,
-                    ..
-                } => {
-                    if let Some(src) = generator_source(generator_id, metadata) {
+                    if let Some(src) = clip_source(binding, clip) {
                         return Some(src);
                     }
+                }
+                TimelineNodeKind::Generator { generator_id, metadata, .. } => {
+                    if let Some(src) = generator_source(generator_id, metadata) { return Some(src); }
                 }
                 _ => {}
             }

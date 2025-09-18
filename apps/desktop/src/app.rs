@@ -33,10 +33,17 @@ struct App {
     engine: EngineState,
     // Debounce decode commands: remember last sent (state, path, optional seek bucket)
     last_sent: Option<(PlayState, String, Option<i64>)>,
+    // Epsilon-based dispatch tracking
+    last_seek_sent_pts: Option<f64>,
+    last_play_reanchor_time: Option<Instant>,
     // Throttled engine log state
     // (Used only for preview_ui logging when sending worker commands)
     // Not strictly necessary, but kept for future UI log hygiene.
     // last_engine_log: Option<Instant>,
+    // Strict paused behavior toggle (UI)
+    strict_pause: bool,
+    // Track when a paused seek was requested (for overlay timing)
+    last_seek_request_at: Option<Instant>,
 }
 
 impl App {
@@ -79,6 +86,10 @@ impl App {
             last_preview_key: None,
             engine: EngineState { state: PlayState::Paused, rate: 1.0, target_pts: 0.0 },
             last_sent: None,
+            last_seek_sent_pts: None,
+            last_play_reanchor_time: None,
+            strict_pause: true,
+            last_seek_request_at: None,
         };
         app.sync_tracks_from_graph();
         app
@@ -210,13 +221,14 @@ impl App {
     fn active_video_media_time_graph(&self, timeline_sec: f64) -> Option<(String, f64)> {
         let seq_fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
         let playhead = (timeline_sec * seq_fps).round() as i64;
-        for binding in self.seq.graph.tracks.iter().rev() {
+        // Priority: lower-numbered (top-most) video tracks first
+        for binding in self.seq.graph.tracks.iter() {
             if matches!(binding.kind, TrackKind::Audio) { continue; }
             for node_id in &binding.node_ids {
-                let node = self.seq.graph.nodes.get(node_id)?;
+                let Some(node) = self.seq.graph.nodes.get(node_id) else { continue };
                 let clip = match &node.kind { TimelineNodeKind::Clip(c) => c, _ => continue };
                 if playhead < clip.timeline_range.start || playhead >= clip.timeline_range.end() { continue; }
-                let path = clip.asset_id.clone()?;
+                let Some(path) = clip.asset_id.clone() else { continue };
                 let start_on_timeline_sec = clip.timeline_range.start as f64 / seq_fps;
                 let local_t = (timeline_sec - start_on_timeline_sec).max(0.0);
                 let media_sec = crate::timeline::ui::frames_to_seconds(clip.media_range.start, self.seq.fps) + local_t * clip.playback_rate as f64;
@@ -232,10 +244,10 @@ impl App {
         for binding in self.seq.graph.tracks.iter().rev() {
             if !matches!(binding.kind, TrackKind::Audio) { continue; }
             for node_id in &binding.node_ids {
-                let node = self.seq.graph.nodes.get(node_id)?;
+                let Some(node) = self.seq.graph.nodes.get(node_id) else { continue };
                 let clip = match &node.kind { TimelineNodeKind::Clip(c) => c, _ => continue };
                 if playhead < clip.timeline_range.start || playhead >= clip.timeline_range.end() { continue; }
-                let path = clip.asset_id.clone()?;
+                let Some(path) = clip.asset_id.clone() else { continue };
                 let start_on_timeline_sec = clip.timeline_range.start as f64 / seq_fps;
                 let local_t = (timeline_sec - start_on_timeline_sec).max(0.0);
                 let media_sec = crate::timeline::ui::frames_to_seconds(clip.media_range.start, self.seq.fps) + local_t * clip.playback_rate as f64;
@@ -374,14 +386,23 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // Optimized repaint pacing: adaptive frame rate based on activity
+        // Push-driven repaint is primary (worker triggers request_repaint on new frames).
+        // Safety net: ensure periodic UI updates even if no frames arrive.
         if self.engine.state == PlayState::Playing {
-            let fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
-            let dt = if fps > 0.0 { 1.0 / fps } else { 1.0 / 30.0 };
+            // Try to pace by the active clip fps, bounded by the sequence fps.
+            let seq_fps = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
+            let t_playhead = self.playback_clock.now();
+            let active_fps = if let Some((path, _)) = self.active_video_media_time_graph(t_playhead) {
+                if let Some(latest) = self.decode_mgr.take_latest(&path) { latest.props.fps as f64 } else { f64::NAN }
+            } else {
+                f64::NAN
+            };
+            let clip_fps = if active_fps.is_finite() && active_fps > 0.0 { active_fps } else { seq_fps };
+            let target_fps = clip_fps.min(seq_fps).clamp(10.0, 120.0);
+            let dt = 1.0f64 / target_fps;
             ctx.request_repaint_after(Duration::from_secs_f64(dt));
         } else {
-            // When not playing, only repaint when needed (scrubbing, UI changes)
-            // This reduces CPU usage significantly when idle
+            ctx.request_repaint_after(Duration::from_millis(150));
         }
         // Space toggles play/pause (keep engine.state in sync)
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
@@ -616,44 +637,98 @@ impl eframe::App for App {
                     ui.label(format!("From: {}  Dur: {}f", item.from, item.duration_in_frames));
                     match &mut item.kind {
                         ItemKind::Video { in_offset_sec, rate, .. } => {
+                            // Prepare pending change flags to avoid borrow issues
+                            let mut pending_rate: Option<f32> = None;
+                            let mut pending_offset_frames: Option<i64> = None;
                             ui.separator();
                             ui.label("Video");
                             ui.horizontal(|ui| {
                                 ui.label("Rate");
                                 let mut r = *rate as f64;
-                                if ui.add(egui::DragValue::new(&mut r).clamp_range(0.05..=8.0).speed(0.02)).changed() {
+                                let changed = ui
+                                    .add(egui::DragValue::new(&mut r).clamp_range(0.05..=8.0).speed(0.02))
+                                    .changed();
+                                if changed {
                                     *rate = (r as f32).max(0.01);
+                                    pending_rate = Some(*rate);
                                 }
                                 if ui.small_button("1.0").on_hover_text("Reset").clicked() { *rate = 1.0; }
                             });
                             ui.horizontal(|ui| {
                                 ui.label("In Offset (s)");
                                 let mut o = *in_offset_sec;
-                                if ui.add(egui::DragValue::new(&mut o).clamp_range(0.0..=1_000_000.0).speed(0.01)).changed() {
+                                let changed = ui
+                                    .add(egui::DragValue::new(&mut o).clamp_range(0.0..=1_000_000.0).speed(0.01))
+                                    .changed();
+                                if changed {
                                     *in_offset_sec = o.max(0.0);
+                                    let num = self.seq.fps.num as f64;
+                                    let den = self.seq.fps.den.max(1) as f64;
+                                    let frames = ((o.max(0.0)) * (num / den)).round() as i64;
+                                    pending_offset_frames = Some(frames.max(0));
                                 }
                                 if ui.small_button("0").on_hover_text("Reset").clicked() { *in_offset_sec = 0.0; }
                             });
+                            // Apply pending updates after UI borrows end
+                            if pending_rate.is_some() || pending_offset_frames.is_some() {
+                                if let Ok(uuid) = uuid::Uuid::parse_str(&item.id) {
+                                    let node_id = NodeId(uuid);
+                                    if let Some(mut node) = self.seq.graph.nodes.get(&node_id).cloned() {
+                                        if let TimelineNodeKind::Clip(mut clip) = node.kind.clone() {
+                                            if let Some(r) = pending_rate { clip.playback_rate = r; }
+                                            if let Some(fr) = pending_offset_frames { clip.media_range.start = fr; }
+                                            node.kind = TimelineNodeKind::Clip(clip);
+                                            let _ = self.apply_timeline_command(TimelineCommand::UpdateNode { node });
+                                        }
+                                    }
+                                }
+                            }
                         }
                         ItemKind::Audio { in_offset_sec, rate, .. } => {
+                            let mut pending_rate: Option<f32> = None;
+                            let mut pending_offset_frames: Option<i64> = None;
                             ui.separator();
                             ui.label("Audio");
                             ui.horizontal(|ui| {
                                 ui.label("Rate");
                                 let mut r = *rate as f64;
-                                if ui.add(egui::DragValue::new(&mut r).clamp_range(0.05..=8.0).speed(0.02)).changed() {
+                                let changed = ui
+                                    .add(egui::DragValue::new(&mut r).clamp_range(0.05..=8.0).speed(0.02))
+                                    .changed();
+                                if changed {
                                     *rate = (r as f32).max(0.01);
+                                    pending_rate = Some(*rate);
                                 }
                                 if ui.small_button("1.0").on_hover_text("Reset").clicked() { *rate = 1.0; }
                             });
                             ui.horizontal(|ui| {
                                 ui.label("In Offset (s)");
                                 let mut o = *in_offset_sec;
-                                if ui.add(egui::DragValue::new(&mut o).clamp_range(0.0..=1_000_000.0).speed(0.01)).changed() {
+                                let changed = ui
+                                    .add(egui::DragValue::new(&mut o).clamp_range(0.0..=1_000_000.0).speed(0.01))
+                                    .changed();
+                                if changed {
                                     *in_offset_sec = o.max(0.0);
+                                    let num = self.seq.fps.num as f64;
+                                    let den = self.seq.fps.den.max(1) as f64;
+                                    let frames = ((o.max(0.0)) * (num / den)).round() as i64;
+                                    pending_offset_frames = Some(frames.max(0));
                                 }
                                 if ui.small_button("0").on_hover_text("Reset").clicked() { *in_offset_sec = 0.0; }
                             });
+                            if pending_rate.is_some() || pending_offset_frames.is_some() {
+                                if let Ok(uuid) = uuid::Uuid::parse_str(&item.id) {
+                                    let node_id = NodeId(uuid);
+                                    if let Some(mut node) = self.seq.graph.nodes.get(&node_id).cloned() {
+                                        if let TimelineNodeKind::Clip(mut clip) = node.kind.clone() {
+                                            if let Some(r) = pending_rate { clip.playback_rate = r; }
+                                            if let Some(fr) = pending_offset_frames { clip.media_range.start = fr; }
+                                            node.kind = TimelineNodeKind::Clip(clip);
+                                            let _ = self.apply_timeline_command(TimelineCommand::UpdateNode { node });
+                                        }
+                                    }
+                                }
+                            }
                         }
                         ItemKind::Image { .. } => {
                             ui.separator();

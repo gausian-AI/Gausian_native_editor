@@ -27,7 +27,7 @@ dirs = "5"
 media-io = { path = "../../crates/media-io" }
 pathdiff = "0.2"
 jobs = { path = "../../crates/jobs" }
-native-decoder = { path = "../../crates/native-decoder" }
+native-decoder = { path = "../../crates/native-decoder", features = ["gstreamer"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing = "0.1"
 symphonia = { version = "0.5", features = ["aac", "flac", "vorbis", "mp3", "wav"] }

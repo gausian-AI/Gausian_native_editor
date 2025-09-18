@@ -3,6 +3,15 @@ name = "native-decoder"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Enable a GStreamer-backed decoder implementation.
+gstreamer = [
+  "dep:gstreamer",
+  "dep:gstreamer-video",
+  "dep:gstreamer-app",
+  "dep:gstreamer-pbutils",
+]
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Core Foundation and VideoToolbox bindings
 core-foundation = "0.9"
@@ -42,6 +51,23 @@ tracing-subscriber = "0.3"
 
 [build-dependencies]
 cc = "1.0"
+
+# Optional GStreamer stack
+[dependencies.gstreamer]
+version = "0.22"
+optional = true
+
+[dependencies.gstreamer-video]
+version = "0.22"
+optional = true
+
+[dependencies.gstreamer-app]
+version = "0.22"
+optional = true
+
+[dependencies.gstreamer-pbutils]
+version = "0.22"
+optional = true
 
 [[example]]
 name = "test_videotoolbox"

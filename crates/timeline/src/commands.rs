@@ -438,14 +438,25 @@ pub fn migrate_sequence_tracks(sequence: &crate::Sequence) -> TimelineGraph {
         let mut binding = TrackBinding {
             id: track_id,
             name: legacy_track.name.clone(),
-            kind: if legacy_track
-                .items
-                .iter()
-                .all(|item| matches!(item.kind, crate::ItemKind::Audio { .. }))
-            {
-                TrackKind::Audio
-            } else {
-                TrackKind::Video
+            kind: {
+                // Heuristics:
+                // - Empty tracks: infer from name prefix ("A" -> Audio), else Video.
+                // - Non-empty: Audio only if all items are audio; otherwise Video.
+                if legacy_track.items.is_empty() {
+                    if legacy_track.name.to_ascii_uppercase().starts_with('A') {
+                        TrackKind::Audio
+                    } else {
+                        TrackKind::Video
+                    }
+                } else if legacy_track
+                    .items
+                    .iter()
+                    .all(|item| matches!(item.kind, crate::ItemKind::Audio { .. }))
+                {
+                    TrackKind::Audio
+                } else {
+                    TrackKind::Video
+                }
             },
             node_ids: Vec::new(),
         };

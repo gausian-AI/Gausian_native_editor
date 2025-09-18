@@ -14,6 +14,7 @@ use super::worker::{
     spawn_worker, DecodeCmd, DecodeWorkerRuntime, LatestFrameSlot, VideoFrameOut,
     PREFETCH_BUDGET_PER_TICK,
 };
+use eframe::egui::Context as EguiContext;
 
 #[derive(Default)]
 pub(crate) struct DecodeManager {
@@ -247,12 +248,12 @@ impl DecodeManager {
     }
 
     // Worker management for decoupled decode → render
-    pub(crate) fn ensure_worker(&mut self, path: &str) {
+    pub(crate) fn ensure_worker(&mut self, path: &str, ui_ctx: &EguiContext) {
         let key = Self::normalize_path_key(path);
         if self.workers.contains_key(&key) {
             return;
         }
-        let rt = spawn_worker(&key);
+        let rt = spawn_worker(&key, ui_ctx.clone());
         self.workers.insert(key, rt);
     }
 
@@ -266,8 +267,9 @@ impl DecodeManager {
     pub(crate) fn take_latest(&mut self, path: &str) -> Option<VideoFrameOut> {
         let key = Self::normalize_path_key(path);
         if let Some(w) = self.workers.get(&key) {
-            if let Ok(mut g) = w.slot.0.lock() {
-                return g.take();
+            if let Ok(g) = w.slot.0.lock() {
+                // Peek instead of take to avoid UI flicker between frames.
+                return g.clone();
             }
         }
         None

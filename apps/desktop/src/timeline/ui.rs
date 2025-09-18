@@ -495,12 +495,57 @@ impl App {
                 }
                 // Tracks and clips
                 let mut completed_drag: Option<DragState> = None;
+                // Separate counters for video/audio labels (V1, V2, A1, ...)
+                let mut v_idx: usize = 0;
+                let mut a_idx: usize = 0;
+                let mut aut_idx: usize = 0;
                 for (ti, binding) in self.seq.graph.tracks.iter().enumerate() {
                     let y = rect.top() + ti as f32 * track_h;
+                    let row_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), y),
+                        egui::pos2(rect.right(), y + track_h),
+                    );
+                    // Subtle shaded background per track kind
+                    let row_color = match &binding.kind {
+                        TrackKind::Audio => egui::Color32::from_rgba_unmultiplied(30, 50, 30, 40),
+                        TrackKind::Automation => egui::Color32::from_rgba_unmultiplied(50, 40, 20, 30),
+                        TrackKind::Custom(id) if id == "image" => {
+                            egui::Color32::from_rgba_unmultiplied(35, 40, 55, 40)
+                        }
+                        _ => egui::Color32::from_rgba_unmultiplied(40, 40, 55, 40), // video/default
+                    };
+                    painter.rect_filled(row_rect, 0.0, row_color);
                     // track separator
                     painter.line_segment(
                         [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                         egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+                    );
+                    // Track label with number (Vn/An) at the left
+                    let track_label = match &binding.kind {
+                        TrackKind::Audio => {
+                            a_idx += 1;
+                            format!("A{}", a_idx)
+                        }
+                        TrackKind::Automation => {
+                            aut_idx += 1;
+                            format!("AUT{}", aut_idx)
+                        }
+                        _ => {
+                            v_idx += 1;
+                            format!("V{}", v_idx)
+                        }
+                    };
+                    let name = if binding.name.trim().is_empty() {
+                        track_label.clone()
+                    } else {
+                        format!("{}  ·  {}", track_label, binding.name)
+                    };
+                    painter.text(
+                        egui::pos2(rect.left() + 8.0, y + 14.0),
+                        egui::Align2::LEFT_TOP,
+                        name,
+                        egui::FontId::monospace(12.0),
+                        egui::Color32::from_gray(210),
                     );
                     // items
                     for (ii, node_id) in binding.node_ids.iter().enumerate() {

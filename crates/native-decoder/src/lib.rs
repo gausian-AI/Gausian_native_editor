@@ -28,6 +28,10 @@ pub use macos::VideoToolboxDecoder;
 #[cfg(not(target_os = "macos"))]
 mod fallback;
 
+// Optional GStreamer backend
+#[cfg(feature = "gstreamer")]
+mod gstreamer_backend;
+
 mod wgpu_integration;
 
 /// Video frame data with YUV planes
@@ -94,6 +98,16 @@ pub trait NativeVideoDecoder: Send + Sync {
     fn fed_samples(&self) -> usize {
         0
     }
+
+    /// Hint the decoder about strict paused mode. In strict mode, backends may
+    /// switch to paused + accurate preroll seeks; in streaming mode they may
+    /// resume PLAYING and prefetch behavior. Default: no-op.
+    fn set_strict_paused(&mut self, _strict: bool) {}
+
+    /// Optional fast (key-unit) seek. Default falls back to accurate seek.
+    fn seek_to_keyframe(&mut self, timestamp: f64) -> Result<()> {
+        self.seek_to(timestamp)
+    }
 }
 
 /// Video properties
@@ -132,6 +146,18 @@ pub fn create_decoder<P: AsRef<Path>>(
     path: P,
     config: DecoderConfig,
 ) -> Result<Box<dyn NativeVideoDecoder>> {
+    // If the GStreamer feature is enabled, prefer it on all platforms for evaluation.
+    #[cfg(feature = "gstreamer")]
+    {
+        #[cfg(target_os = "macos")]
+        {
+            // Keep VT path when zero_copy requested to preserve IOSurface integration.
+            if config.zero_copy {
+                return macos::create_videotoolbox_decoder(path, config);
+            }
+        }
+        return gstreamer_backend::create_gst_decoder(path, config);
+    }
     #[cfg(target_os = "macos")]
     {
         macos::create_videotoolbox_decoder(path, config)
@@ -145,6 +171,11 @@ pub fn create_decoder<P: AsRef<Path>>(
 
 /// Check if native decoding is available on this platform
 pub fn is_native_decoding_available() -> bool {
+    // If using GStreamer backend: available when gst::init() succeeds.
+    #[cfg(feature = "gstreamer")]
+    {
+        return gstreamer_backend::is_available();
+    }
     #[cfg(target_os = "macos")]
     {
         macos::is_videotoolbox_available()
