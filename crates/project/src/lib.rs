@@ -128,6 +128,17 @@ impl ProjectDb {
         Ok(())
     }
 
+    pub fn get_project_base_path(&self, id: &str) -> Result<Option<PathBuf>> {
+        let mut stmt = self.conn.prepare("SELECT base_path FROM projects WHERE id = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            let bp: Option<String> = row.get(0)?;
+            Ok(bp.map(|s| PathBuf::from(s)))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn insert_asset_row(
         &self,
         project_id: &str,
@@ -223,6 +234,22 @@ impl ProjectDb {
         }
         Ok(out)
     }
+
+    pub fn list_projects(&self) -> Result<Vec<ProjectInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, base_path FROM projects ORDER BY updated_at DESC, created_at DESC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ProjectInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                base_path: row.get::<_, Option<String>>(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +263,13 @@ pub struct AssetRow {
     pub duration_frames: Option<i64>,
     pub fps_num: Option<i64>,
     pub fps_den: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectInfo {
+    pub id: String,
+    pub name: String,
+    pub base_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -311,5 +345,36 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO migrations(name, applied_at) VALUES(?1, strftime('%s','now'))",
         params!["V0002__jobs"],
     )?;
+    // Project timeline (V0003)
+    conn.execute_batch(include_str!("../migrations/V0003__timeline.sql"))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations(name, applied_at) VALUES(?1, strftime('%s','now'))",
+        params!["V0003__timeline"],
+    )?;
     Ok(())
+}
+
+impl ProjectDb {
+    pub fn get_project_timeline_json(&self, project_id: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT json FROM project_timeline WHERE project_id = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(params![project_id])?;
+        if let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            Ok(Some(json))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn upsert_project_timeline_json(&self, project_id: &str, json: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO project_timeline(project_id, json, updated_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at",
+            params![project_id, json, now],
+        )?;
+        Ok(())
+    }
 }

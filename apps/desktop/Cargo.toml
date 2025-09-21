@@ -31,9 +31,13 @@ native-decoder = { path = "../../crates/native-decoder", features = ["gstreamer"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing = "0.1"
 symphonia = { version = "0.5", features = ["aac", "flac", "vorbis", "mp3", "wav"] }
+webbrowser = "0.8"
+walkdir = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [features]
 unsafe-interop = []
+embed-webview = ["cocoa", "objc"]
 
 # If you use cpal or rodio, make them mac-first via target sections.
 # It's OK if only one of these appears in your repo; keep both sections—Cargo ignores unused ones.
@@ -42,6 +46,9 @@ unsafe-interop = []
 # Use CoreAudio on macOS (cpal selects correct backend automatically)
 cpal = { version = "0.15" }
 rodio = { version = "0.17" }
+# For embedded WKWebView (feature-gated)
+cocoa = { version = "0.25", optional = true }
+objc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Keep ALSA available on Linux (cpal selects correct backend automatically)

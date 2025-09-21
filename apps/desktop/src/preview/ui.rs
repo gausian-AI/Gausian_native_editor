@@ -140,6 +140,45 @@ impl App {
             return;
         }
 
+        // Special-case images: render directly without video decode/seek
+        if src.is_image {
+            // Load or refresh texture when source or size changes
+            let need_reload = match self.preview.current_source.as_ref() {
+                Some(prev) => prev.path != src.path || self.preview.last_size != (w as u32, h as u32),
+                None => true,
+            };
+            if need_reload {
+                match image::open(&src.path) {
+                    Ok(img) => {
+                        let resized = img.resize(w as u32, h as u32, image::imageops::FilterType::Lanczos3);
+                        let rgba = resized.to_rgba8();
+                        let (iw, ih) = rgba.dimensions();
+                        let bytes = rgba.as_raw();
+                        let color = egui::ColorImage::from_rgba_unmultiplied([iw as usize, ih as usize], bytes);
+                        let tex = ctx.load_texture("preview_image", color, egui::TextureOptions::LINEAR);
+                        self.preview.texture = Some(tex);
+                        self.preview.current_source = Some(src.clone());
+                        self.preview.last_size = (w as u32, h as u32);
+                    }
+                    Err(_) => {
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Failed to load image",
+                            egui::FontId::proportional(16.0),
+                            egui::Color32::RED,
+                        );
+                        return;
+                    }
+                }
+            }
+            if let Some(tex) = &self.preview.texture {
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                painter.image(tex.id(), rect, uv, egui::Color32::WHITE);
+            }
+            return;
+        }
+
         let (active_path, media_t) = self
             .active_video_media_time_graph(t_playhead)
             .unwrap_or_else(|| (src.path.clone(), t_playhead));

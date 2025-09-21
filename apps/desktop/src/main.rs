@@ -33,6 +33,8 @@ mod audio_engine;
 mod export;
 mod jobs;
 mod preview;
+mod comfyui;
+mod embed_webview;
 use audio_decode::decode_audio_to_buffer;
 use audio_engine::{ActiveAudioClip, AudioBuffer, AudioEngine};
 pub use export::{ExportCodec, ExportPreset, ExportProgress, ExportUiState};
@@ -46,6 +48,8 @@ use preview::PreviewState;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::hash::Hash;
+use walkdir::WalkDir;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 
 static PRESENT_SIZE_MISMATCH_LOGGED: OnceLock<AtomicBool> = OnceLock::new();
 
@@ -73,14 +77,30 @@ fn nearest_common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
     if paths.is_empty() {
         return None;
     }
+    // Normalize each path to a directory (if it's a file, use its parent).
+    let to_dir = |p: &PathBuf| -> PathBuf {
+        match std::fs::metadata(p) {
+            Ok(md) => {
+                if md.is_file() {
+                    p.parent().map(|pp| pp.to_path_buf()).unwrap_or_else(|| p.clone())
+                } else {
+                    p.clone()
+                }
+            }
+            Err(_) => p.parent().map(|pp| pp.to_path_buf()).unwrap_or_else(|| p.clone()),
+        }
+    };
     let mut it = paths.iter();
-    let mut acc = it
-        .next()?
+    let first = it.next()?;
+    let mut acc = first
         .ancestors()
-        .map(|p| p.to_path_buf())
+        .map(|p| to_dir(&p.to_path_buf()))
         .collect::<Vec<_>>();
     for p in it {
-        let set = p.ancestors().map(|p| p.to_path_buf()).collect::<Vec<_>>();
+        let set = p
+            .ancestors()
+            .map(|a| to_dir(&a.to_path_buf()))
+            .collect::<Vec<_>>();
         acc.retain(|cand| set.contains(cand));
         if acc.is_empty() {
             break;

@@ -15,6 +15,9 @@ impl Default for PreviewSettings {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppMode { ProjectPicker, Editor }
+
 struct App {
     db: ProjectDb,
     project_id: String,
@@ -66,17 +69,112 @@ struct App {
     // User settings
     settings: PreviewSettings,
     show_settings: bool,
+    // ComfyUI integration (Phase 1)
+    comfy: crate::comfyui::ComfyUiManager,
+    show_comfy_panel: bool,
+    // Editable input for ComfyUI repo path (separate from committed config)
+    comfy_repo_input: String,
+    // Installer UI state
+    comfy_install_dir_input: String,
+    comfy_torch_backend: crate::comfyui::TorchBackend,
+    comfy_venv_python_input: String,
+    comfy_recreate_venv: bool,
+    comfy_install_ffmpeg: bool,
+    pip_index_url_input: String,
+    pip_extra_index_url_input: String,
+    pip_trusted_hosts_input: String,
+    pip_proxy_input: String,
+    pip_no_cache: bool,
+    // Embedded ComfyUI webview
+    comfy_embed_inside: bool,
+    #[allow(dead_code)]
+    comfy_webview: Option<Box<dyn crate::embed_webview::WebViewHost>>,
+    comfy_devtools: bool,
+    comfy_embed_logs: std::collections::VecDeque<String>,
+    // Placement and sizing for embedded view
+    comfy_embed_in_assets: bool,
+    comfy_assets_height: f32,
+    // Floating ComfyUI panel window visibility
+    show_comfy_view_window: bool,
+    // Auto-import from ComfyUI outputs
+    comfy_auto_import: bool,
+    comfy_import_logs: std::collections::VecDeque<String>,
+    comfy_ingest_thread: Option<std::thread::JoinHandle<()>>,
+    comfy_ingest_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    comfy_ingest_rx: Receiver<(String, std::path::PathBuf)>,
+    comfy_ingest_tx: Sender<(String, std::path::PathBuf)>,
+    // Project id that the ingest thread is currently bound to (for routing)
+    comfy_ingest_project_id: Option<String>,
+    // Projects page
+    show_projects: bool,
+    new_project_name: String,
+    new_project_base: String,
+    // App mode: show project picker before opening editor
+    mode: AppMode,
+    // Autosave indicator
+    last_save_at: Option<Instant>,
 }
 
 impl App {
+    fn ensure_baseline_tracks(&mut self) {
+        if self.seq.graph.tracks.is_empty() {
+            // Add three video and three audio tracks by default
+            for i in 1..=3 {
+                let binding = timeline_crate::TrackBinding { id: timeline_crate::TrackId::new(), name: format!("V{}", i), kind: timeline_crate::TrackKind::Video, node_ids: Vec::new() };
+                let _ = self.apply_timeline_command(timeline_crate::TimelineCommand::UpsertTrack { track: binding });
+            }
+            for i in 1..=3 {
+                let binding = timeline_crate::TrackBinding { id: timeline_crate::TrackId::new(), name: format!("A{}", i), kind: timeline_crate::TrackKind::Audio, node_ids: Vec::new() };
+                let _ = self.apply_timeline_command(timeline_crate::TimelineCommand::UpsertTrack { track: binding });
+            }
+            self.sync_tracks_from_graph();
+        }
+    }
+    fn load_project_timeline(&mut self) {
+        if let Ok(Some(json)) = self.db.get_project_timeline_json(&self.project_id) {
+            if let Ok(seq) = serde_json::from_str::<timeline_crate::Sequence>(&json) {
+                self.seq = seq;
+            } else {
+                let mut seq = timeline_crate::Sequence::new("Main", 1920, 1080, timeline_crate::Fps::new(30,1), 600);
+                // Baseline: three video + three audio legacy tracks for migration
+                for i in 1..=3 { seq.add_track(timeline_crate::Track { name: format!("V{}", i), items: vec![] }); }
+                for i in 1..=3 { seq.add_track(timeline_crate::Track { name: format!("A{}", i), items: vec![] }); }
+                self.seq = seq;
+            }
+        } else {
+            let mut seq = timeline_crate::Sequence::new("Main", 1920, 1080, timeline_crate::Fps::new(30,1), 600);
+            for i in 1..=3 { seq.add_track(timeline_crate::Track { name: format!("V{}", i), items: vec![] }); }
+            for i in 1..=3 { seq.add_track(timeline_crate::Track { name: format!("A{}", i), items: vec![] }); }
+            self.seq = seq;
+            // Do NOT auto-save an empty timeline over a project that has none yet.
+            // We'll save on the first edit or explicit action to avoid wiping unsaved work.
+        }
+        // Use saved graph if present; migrate only legacy sequences with empty graph
+        if self.seq.graph.tracks.is_empty() {
+            self.seq.graph = timeline_crate::migrate_sequence_tracks(&self.seq);
+        }
+        // Ensure denormalized tracks list reflects the graph for UI
+        self.sync_tracks_from_graph();
+        self.ensure_baseline_tracks();
+        self.timeline_history = timeline_crate::CommandHistory::default();
+        self.selected = None;
+        self.drag = None;
+    }
+
+    fn save_project_timeline(&mut self) -> anyhow::Result<()> {
+        let json = serde_json::to_string(&self.seq)?;
+        self.db.upsert_project_timeline_json(&self.project_id, &json)?;
+        self.last_save_at = Some(Instant::now());
+        Ok(())
+    }
     fn new(db: ProjectDb) -> Self {
         let project_id = "default".to_string();
         let _ = db.ensure_project(&project_id, "Default Project", None);
         let mut seq = Sequence::new("Main", 1920, 1080, Fps::new(30, 1), 600);
         if seq.tracks.is_empty() {
-            seq.add_track(Track { name: "V1".into(), items: vec![] });
-            seq.add_track(Track { name: "V2".into(), items: vec![] });
-            seq.add_track(Track { name: "A1".into(), items: vec![] });
+            // Default to three video and three audio tracks
+            for i in 1..=3 { seq.add_track(Track { name: format!("V{}", i), items: vec![] }); }
+            for i in 1..=3 { seq.add_track(Track { name: format!("A{}", i), items: vec![] }); }
         }
         seq.graph = timeline_crate::migrate_sequence_tracks(&seq);
         let db_path = db.path().to_path_buf();
@@ -115,7 +213,56 @@ impl App {
             last_present_pts: None,
             settings: PreviewSettings::default(),
             show_settings: false,
+            comfy: crate::comfyui::ComfyUiManager::default(),
+            show_comfy_panel: false,
+            comfy_repo_input: String::new(),
+            comfy_install_dir_input: crate::comfyui::ComfyUiManager::default_install_dir()
+                .to_string_lossy()
+                .to_string(),
+            comfy_torch_backend: crate::comfyui::TorchBackend::Auto,
+            comfy_venv_python_input: String::new(),
+            comfy_recreate_venv: false,
+            comfy_install_ffmpeg: true,
+            pip_index_url_input: String::new(),
+            pip_extra_index_url_input: String::new(),
+            pip_trusted_hosts_input: String::new(),
+            pip_proxy_input: String::new(),
+            pip_no_cache: false,
+            comfy_embed_inside: cfg!(all(target_os = "macos", feature = "embed-webview")),
+            comfy_webview: None,
+            comfy_devtools: false,
+            comfy_embed_logs: std::collections::VecDeque::with_capacity(128),
+            comfy_embed_in_assets: true,
+            comfy_assets_height: 320.0,
+            show_comfy_view_window: true,
+            comfy_auto_import: true,
+            comfy_import_logs: std::collections::VecDeque::with_capacity(256),
+            comfy_ingest_thread: None,
+            comfy_ingest_stop: None,
+            // channel will be set below
+            comfy_ingest_rx: {
+                let (_tx, rx) = unbounded::<(String, std::path::PathBuf)>();
+                rx
+            },
+            comfy_ingest_tx: {
+                let (tx, _rx) = unbounded::<(String, std::path::PathBuf)>();
+                tx
+            },
+            comfy_ingest_project_id: None,
+            show_projects: false,
+            new_project_name: String::new(),
+            new_project_base: String::new(),
+            mode: AppMode::ProjectPicker,
+            last_save_at: None,
         };
+        // Replace placeholder channels with a real pair
+        let (tx, rx) = unbounded();
+        app.comfy_ingest_tx = tx;
+        app.comfy_ingest_rx = rx;
+        // Initialize ComfyUI repo input from current config (if any)
+        if let Some(p) = app.comfy.config().repo_path.as_ref() {
+            app.comfy_repo_input = p.to_string_lossy().to_string();
+        }
         app.sync_tracks_from_graph();
         app
     }
@@ -123,6 +270,8 @@ impl App {
     fn apply_timeline_command(&mut self, command: TimelineCommand) -> Result<(), TimelineError> {
         self.timeline_history.apply(&mut self.seq.graph, command)?;
         self.sync_tracks_from_graph();
+        // Autosave timeline after each edit (best-effort)
+        let _ = self.save_project_timeline();
         Ok(())
     }
 
@@ -163,17 +312,39 @@ impl App {
             }
             (TimelineNodeKind::Clip(clip), _) => {
                 let src = clip.asset_id.clone().unwrap_or_default();
-                Some(Item {
-                    id,
-                    from: clip.timeline_range.start,
-                    duration_in_frames: clip.timeline_range.duration,
-                    kind: ItemKind::Video {
-                        src,
-                        frame_rate: Some(fps.num as f32 / fps.den.max(1) as f32),
-                        in_offset_sec: crate::timeline::ui::frames_to_seconds(clip.media_range.start, fps),
-                        rate: clip.playback_rate,
-                    },
-                })
+                let is_image = std::path::Path::new(&src)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("png")
+                        || s.eq_ignore_ascii_case("jpg")
+                        || s.eq_ignore_ascii_case("jpeg")
+                        || s.eq_ignore_ascii_case("gif")
+                        || s.eq_ignore_ascii_case("webp")
+                        || s.eq_ignore_ascii_case("bmp")
+                        || s.eq_ignore_ascii_case("tif")
+                        || s.eq_ignore_ascii_case("tiff")
+                        || s.eq_ignore_ascii_case("exr"))
+                    .unwrap_or(false);
+                if is_image {
+                    Some(Item {
+                        id,
+                        from: clip.timeline_range.start,
+                        duration_in_frames: clip.timeline_range.duration,
+                        kind: ItemKind::Image { src },
+                    })
+                } else {
+                    Some(Item {
+                        id,
+                        from: clip.timeline_range.start,
+                        duration_in_frames: clip.timeline_range.duration,
+                        kind: ItemKind::Video {
+                            src,
+                            frame_rate: Some(fps.num as f32 / fps.den.max(1) as f32),
+                            in_offset_sec: crate::timeline::ui::frames_to_seconds(clip.media_range.start, fps),
+                            rate: clip.playback_rate,
+                        },
+                    })
+                }
             }
             (TimelineNodeKind::Generator { generator_id, timeline_range, metadata }, _) => {
                 match generator_id.as_str() {
@@ -300,11 +471,16 @@ impl App {
     }
 
     fn import_files(&mut self, files: &[PathBuf]) -> Result<()> {
+        let pid = self.project_id.clone();
+        self.import_files_for(&pid, files)
+    }
+
+    fn import_files_for(&mut self, project_id: &str, files: &[PathBuf]) -> Result<()> {
         if files.is_empty() { return Ok(()); }
         let ancestor = nearest_common_ancestor(files);
-        if let Some(base) = ancestor.as_deref() { self.db.set_project_base_path(&self.project_id, base)?; }
+        if let Some(base) = ancestor.as_deref() { self.db.set_project_base_path(project_id, base)?; }
         let db_path = self.db.path().to_path_buf();
-        let project_id = self.project_id.clone();
+        let project_id = project_id.to_string();
         for f in files.to_vec() {
             let base = ancestor.clone();
             let db_path = db_path.clone();
@@ -411,6 +587,183 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Drain any completed files from ComfyUI ingest and import them
+        while let Ok((proj_id, path)) = self.comfy_ingest_rx.try_recv() {
+            // Determine project base path
+            let mut base = self
+                .db
+                .get_project_base_path(&proj_id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    // Default base under app data dir if not set
+                    let p = project::app_data_dir().join("projects").join(&proj_id);
+                    let _ = std::fs::create_dir_all(&p);
+                    let _ = self.db.set_project_base_path(&proj_id, &p);
+                    p
+                });
+            // If base was incorrectly set to a file (e.g., from single-file import), use its parent dir.
+            if base.is_file() {
+                if let Some(parent) = base.parent() {
+                    let parent = parent.to_path_buf();
+                    let _ = self.db.set_project_base_path(&proj_id, &parent);
+                    base = parent;
+                }
+            }
+            let media_dir = base.join("media").join("comfy");
+            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let dest_dir = media_dir.join(date);
+            let _ = std::fs::create_dir_all(&dest_dir);
+            let file_name = std::path::Path::new(&path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "output.mp4".to_string());
+            let mut dest = dest_dir.join(&file_name);
+            // Ensure unique name
+            if dest.exists() {
+                let stem = dest
+                    .file_stem()
+                    .and_then(|s| Some(s.to_string_lossy().to_string()))
+                    .unwrap_or_else(|| "output".to_string());
+                let ext = dest.extension().and_then(|e| Some(e.to_string_lossy().to_string()));
+                let mut i = 1;
+                loop {
+                    let candidate = dest_dir.join(format!(
+                        "{}-{}.{}",
+                        stem,
+                        i,
+                        ext.as_deref().unwrap_or("mp4")
+                    ));
+                    if !candidate.exists() {
+                        dest = candidate;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // True move semantics: try rename; on cross-device or other failures, copy then delete.
+            let mut did_move = false;
+            match std::fs::rename(&path, &dest) {
+                Ok(_) => { did_move = true; }
+                Err(rename_err) => {
+                    match std::fs::copy(&path, &dest) {
+                        Ok(_) => {
+                            // Best-effort remove original after successful copy
+                            if let Err(rem_err) = std::fs::remove_file(&path) {
+                                self.comfy_import_logs.push_back(format!(
+                                    "Warning: copied (fallback) but failed to remove original {}: {}",
+                                    path.to_string_lossy(), rem_err
+                                ));
+                            }
+                        }
+                        Err(copy_err) => {
+                            self.comfy_import_logs.push_back(format!(
+                                "Import move failed (rename: {}, copy: {}) {} -> {}",
+                                rename_err,
+                                copy_err,
+                                path.to_string_lossy(),
+                                dest.to_string_lossy(),
+                            ));
+                            continue; // Skip import on failure
+                        }
+                    }
+                }
+            }
+            let _ = self.import_files_for(&proj_id, &[dest.clone()]);
+            self.comfy_import_logs.push_back(if did_move {
+                format!("Moved into {}: {}", proj_id, dest.to_string_lossy())
+            } else {
+                format!("Copied into {}: {}", proj_id, dest.to_string_lossy())
+            });
+        }
+        // Start/stop ingest thread depending on state
+        // Auto-import does not strictly require the server to be running;
+        // as long as the ComfyUI repo/output folder is known, watch it.
+        // If the open project changes, restart the watcher so events are
+        // attributed to the project that was active when detection started.
+        if let Some(pid) = &self.comfy_ingest_project_id {
+            if Some(pid) != Some(&self.project_id) {
+                if let Some(flag) = &self.comfy_ingest_stop { flag.store(true, Ordering::Relaxed); }
+                if let Some(h) = self.comfy_ingest_thread.take() { let _ = h.join(); }
+                self.comfy_ingest_stop = None;
+                self.comfy_ingest_project_id = None;
+            }
+        }
+        let out_dir_cfg = self
+            .comfy
+            .config()
+            .repo_path
+            .as_ref()
+            .map(|p| p.join("output"));
+        let can_watch = out_dir_cfg.as_ref().map(|d| d.exists()).unwrap_or(false);
+        if self.comfy_auto_import && can_watch {
+            if self.comfy_ingest_thread.is_none() {
+                if let Some(dir) = out_dir_cfg {
+                    let dir_s = dir.to_string_lossy().to_string();
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let tx = self.comfy_ingest_tx.clone();
+                    let dir_clone = dir.clone();
+                    let start_pid = self.project_id.clone();
+                    let pid_for_thread = start_pid.clone();
+                    let handle = std::thread::spawn({
+                        let stop = Arc::clone(&stop);
+                        move || {
+                            use std::collections::{HashMap, HashSet};
+                            use std::thread::sleep;
+                            let mut seen: HashSet<String> = HashSet::new();
+                            let mut stable: HashMap<String, (u64, u8)> = HashMap::new();
+                            let allowed_exts = [
+                                // videos
+                                "mp4", "mov", "webm", "mkv", "avi", "gif",
+                                // images
+                                "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "exr",
+                            ];
+                            while !stop.load(Ordering::Relaxed) {
+                                for entry in WalkDir::new(&dir_clone).into_iter().filter_map(|e| e.ok()) {
+                                    if !entry.file_type().is_file() { continue; }
+                                    let p = entry.path();
+                                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                                    if !allowed_exts.contains(&ext.as_str()) { continue; }
+                                    let key = p.to_string_lossy().to_string();
+                                    if seen.contains(&key) { continue; }
+                                    if let Ok(md) = entry.metadata() {
+                                        let size = md.len();
+                                        match stable.get_mut(&key) {
+                                            Some((last, hits)) => {
+                                                if *last == size {
+                                                    *hits += 1;
+                                                    if *hits >= 3 {
+                                                        let _ = tx.send((pid_for_thread.clone(), p.to_path_buf()));
+                                                        stable.remove(&key);
+                                                        seen.insert(key.clone());
+                                                    }
+                                                } else {
+                                                    *last = size; *hits = 0;
+                                                }
+                                            }
+                                            None => { stable.insert(key.clone(), (size, 0)); }
+                                        }
+                                    }
+                                }
+                                sleep(std::time::Duration::from_millis(700));
+                            }
+                        }
+                    });
+                    self.comfy_ingest_stop = Some(stop);
+                    self.comfy_ingest_thread = Some(handle);
+                    self.comfy_ingest_project_id = Some(start_pid);
+                    self.comfy_import_logs.push_back(format!(
+                        "Watching Comfy outputs: {}",
+                        dir_s
+                    ));
+                }
+            }
+        } else {
+            if let Some(flag) = &self.comfy_ingest_stop { flag.store(true, Ordering::Relaxed); }
+            if let Some(h) = self.comfy_ingest_thread.take() { let _ = h.join(); }
+            self.comfy_ingest_stop = None;
+            self.comfy_ingest_project_id = None;
+        }
         // Push-driven repaint is primary (worker triggers request_repaint on new frames).
         // Safety net: ensure periodic UI updates even if no frames arrive.
         if self.engine.state == PlayState::Playing {
@@ -464,6 +817,12 @@ impl eframe::App for App {
                 if ui.button("Export...").clicked() {
                     self.export_sequence();
                 }
+                if ui.button("Back to Projects").clicked() {
+                    let _ = self.save_project_timeline();
+                    self.mode = AppMode::ProjectPicker;
+                    // Close embedded view to avoid overlaying the picker
+                    if let Some(mut host) = self.comfy_webview.take() { host.close(); }
+                }
                 if ui.button("Jobs").clicked() {
                     self.show_jobs = !self.show_jobs;
                 }
@@ -507,12 +866,76 @@ impl eframe::App for App {
                 ui.small("Higher tolerance = more off-target frames accepted. Higher clear threshold = fewer blanks on small nudges.");
             });
 
-        // Export dialog UI
+        // Project Picker page before opening editor
+        if matches!(self.mode, AppMode::ProjectPicker) {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Select a Project");
+                ui.separator();
+                let projects = self.db.list_projects().unwrap_or_default();
+                // Visual grid of project cards
+                ui.horizontal_wrapped(|ui| {
+                    let card_w = 220.0;
+                    let card_h = 170.0;
+                    for p in &projects {
+                        ui.group(|ui| {
+                            ui.set_width(card_w);
+                            // Thumbnail placeholder (16:9) with project initial
+                            let thumb_h = (card_w / 16.0) * 9.0;
+                            let (r, _resp) = ui.allocate_exact_size(egui::vec2(card_w - 16.0, thumb_h), egui::Sense::hover());
+                            let c = egui::Color32::from_rgb(70, 80, 95);
+                            ui.painter().rect_filled(r.shrink(2.0), 6.0, c);
+                            let initial = p.name.chars().next().unwrap_or('?');
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, initial, egui::FontId::proportional(28.0), egui::Color32::WHITE);
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(&p.name).strong());
+                            if let Some(bp) = &p.base_path { ui.small(bp); }
+                            ui.add_space(4.0);
+                                if ui.button("Open").clicked() {
+                                    self.project_id = p.id.clone();
+                                    self.selected = None;
+                                    self.drag = None;
+                                    self.load_project_timeline();
+                                    self.mode = AppMode::Editor;
+                                }
+                        });
+                        ui.add_space(8.0);
+                    }
+                });
+                ui.separator();
+                ui.heading("Create Project");
+                ui.horizontal(|ui| { ui.label("Name"); ui.text_edit_singleline(&mut self.new_project_name); });
+                ui.small("Base path will be created under app data automatically.");
+                if ui.add_enabled(!self.new_project_name.trim().is_empty(), egui::Button::new("Create")).clicked() {
+                    // Auto-create base path under app data dir
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let safe_name = self.new_project_name.trim();
+                    let mut base = project::app_data_dir().join("projects").join(safe_name);
+                    // Ensure unique
+                    let mut i = 1;
+                    while base.exists() { base = project::app_data_dir().join("projects").join(format!("{}-{}", safe_name, i)); i += 1; }
+                    let _ = std::fs::create_dir_all(&base);
+                    let _ = self.db.ensure_project(&id, safe_name, Some(&base));
+                    self.project_id = id;
+                    self.new_project_name.clear();
+                    self.load_project_timeline();
+                    self.mode = AppMode::Editor;
+                }
+            });
+            return;
+        }
+
+        // Export dialog UI (editor mode only)
         self.export.ui(ctx, &self.seq, &self.db, &self.project_id);
 
         // Preview panel will be inside CentralPanel with resizable area
 
-        egui::SidePanel::left("assets").default_width(340.0).show(ctx, |ui| {
+        egui::SidePanel::left("assets")
+            .default_width(200.0)
+            .resizable(true)
+            .min_width(110.0)
+            .max_width(1600.0)
+            .show(ctx, |ui| {
+            // Top area (not scrolling): toolbar + optional embedded ComfyUI
             self.poll_jobs();
             ui.heading("Assets");
             ui.horizontal(|ui| {
@@ -523,7 +946,93 @@ impl eframe::App for App {
                 }
                 if ui.button("Refresh").clicked() {}
                 if ui.button("Jobs").clicked() { self.show_jobs = !self.show_jobs; }
+                if ui.button("ComfyUI").clicked() { self.show_comfy_panel = !self.show_comfy_panel; }
             });
+
+            // Embedded ComfyUI panel at top of assets (outside scrolling region)
+            if self.comfy_embed_inside && self.comfy_embed_in_assets {
+                let running = self.comfy.is_running();
+                ui.horizontal(|ui| {
+                    ui.strong("ComfyUI");
+                    ui.add(egui::Slider::new(&mut self.comfy_assets_height, 200.0..=900.0).text("Height"));
+                    ui.separator();
+                    if ui.small_button("Reload").clicked() {
+                        if let Some(h) = self.comfy_webview.as_mut() { h.reload(); self.comfy_embed_logs.push_back("Reload requested".into()); }
+                    }
+                    let mut dt = self.comfy_devtools;
+                    if ui.checkbox(&mut dt, "DevTools").changed() {
+                        self.comfy_devtools = dt;
+                        if let Some(h) = self.comfy_webview.as_mut() { h.set_devtools(dt); }
+                        self.comfy_embed_logs.push_back(format!("DevTools {}", if dt {"enabled"} else {"disabled"}));
+                    }
+                    if ui.small_button("Inspector").clicked() {
+                        if let Some(h) = self.comfy_webview.as_mut() { let _ = h.open_inspector(); }
+                    }
+                    if ui.small_button("Browser").clicked() { let _ = webbrowser::open(&self.comfy.url()); }
+                    ui.separator();
+                    ui.checkbox(&mut self.comfy_auto_import, "Auto-import");
+                });
+                ui.separator();
+                if running {
+                    // Ensure host exists
+                    if self.comfy_webview.is_none() {
+                        if let Some(mut host) = crate::embed_webview::create_platform_host() {
+                            if self.comfy_devtools { host.set_devtools(true); }
+                            host.navigate(&self.comfy.url());
+                            host.set_visible(true);
+                            self.comfy_webview = Some(host);
+                            self.comfy_embed_logs.push_back("Embedded view created (assets)".into());
+                        } else {
+                            self.comfy_embed_logs.push_back("Failed to create embedded view (assets)".into());
+                        }
+                    }
+                    // Reserve area and position overlay to match this rect
+                    // Leave a small right-side margin so the panel's resize grab remains clickable.
+                    let w = (ui.available_width() - 8.0).max(0.0);
+                    let size = egui::vec2(w, self.comfy_assets_height);
+                    let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    if let Some(host) = self.comfy_webview.as_mut() {
+                        // Use floor for x/top and ceil for width/height to avoid overlap from rounding.
+                        let to_floor = |v: f32| -> i32 { v.floor() as i32 };
+                        let to_ceil = |v: f32| -> i32 { v.ceil() as i32 };
+                        let r = crate::embed_webview::RectPx {
+                            x: to_floor(rect.left()),
+                            y: to_floor(rect.top()),
+                            w: to_ceil(rect.width()),
+                            h: to_ceil(rect.height()),
+                        };
+                        host.set_rect(r);
+                        host.set_visible(true);
+                    }
+                    // Resizable handle below the ComfyUI view (adjusts section height)
+                    ui.add_space(2.0);
+                    let handle_h = 8.0;
+                    let (hrect, hresp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), handle_h),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let hovered = hresp.hovered() || hresp.dragged();
+                    let stroke = if hovered {
+                        egui::Stroke::new(2.0, egui::Color32::from_gray(220))
+                    } else {
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(150))
+                    };
+                    ui.painter().line_segment([hrect.left_center(), hrect.right_center()], stroke);
+                    if hresp.dragged() {
+                        self.comfy_assets_height = (self.comfy_assets_height + hresp.drag_delta().y)
+                            .clamp(200.0, 900.0);
+                    }
+                    ui.separator();
+                } else {
+                    if let Some(mut host) = self.comfy_webview.take() { host.close(); }
+                }
+            } else {
+                // If not embedding here, ensure any previous assets-embedded view is closed
+                // (Bottom dock may manage webview separately.)
+            }
+
+                // Scrolling region: the rest of the side panel content
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             
             // Show hardware encoders info
             ui.collapsing("Hardware Encoders", |ui| {
@@ -639,6 +1148,281 @@ impl eframe::App for App {
                     ui.label("Falling back to FFmpeg-based decoding");
                 }
             });
+
+            // ComfyUI (Phase 1 + basic Phase 2 installer)
+            if self.show_comfy_panel {
+                ui.separator();
+                ui.heading("ComfyUI");
+                ui.small("Set the ComfyUI repository path (folder containing main.py). Start server locally and open embedded window.");
+                ui.horizontal(|ui| {
+                    let mut embed = self.comfy_embed_inside;
+                    if ui.checkbox(&mut embed, "Open inside editor").changed() {
+                        self.comfy_embed_inside = embed;
+                        if !embed {
+                            if let Some(mut host) = self.comfy_webview.take() { host.close(); }
+                            self.comfy_embed_logs.push_back("Embedded view closed".into());
+                        }
+                    }
+                    if cfg!(not(all(target_os = "macos", feature = "embed-webview"))) {
+                        ui.small("(embed requires macOS build with feature: embed-webview)");
+                    }
+                    if self.comfy_embed_inside {
+                        if ui.small_button("Reload").clicked() {
+                            if let Some(h) = self.comfy_webview.as_mut() { h.reload(); self.comfy_embed_logs.push_back("Reload requested".into()); }
+                        }
+                        let mut dt = self.comfy_devtools;
+                        if ui.checkbox(&mut dt, "DevTools").on_hover_text("Enable WebKit developer extras; right-click → Inspect").changed() {
+                            self.comfy_devtools = dt;
+                            if let Some(h) = self.comfy_webview.as_mut() { h.set_devtools(dt); }
+                            self.comfy_embed_logs.push_back(format!("DevTools {}", if dt {"enabled"} else {"disabled"}));
+                        }
+                        if ui.small_button("Open Inspector").clicked() {
+                            if let Some(h) = self.comfy_webview.as_mut() {
+                                let ok = h.open_inspector();
+                                self.comfy_embed_logs.push_back(if ok { "Inspector opened".into() } else { "Inspector unavailable; enable DevTools, then right-click → Inspect".into() });
+                            } else {
+                                self.comfy_embed_logs.push_back("Inspector: no embedded view".into());
+                            }
+                        }
+                        ui.separator();
+                        let mut ai = self.comfy_auto_import;
+                        if ui.checkbox(&mut ai, "Auto-import outputs").on_hover_text("Watch ComfyUI output folder and import finished videos into this project").changed() {
+                            self.comfy_auto_import = ai;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Repo Path");
+                    let resp = ui.text_edit_singleline(&mut self.comfy_repo_input);
+                    let enter_commit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let save_clicked = ui.small_button("Save").on_hover_text("Commit path to settings").clicked();
+                    if ui.small_button("Browse…").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                            self.comfy_repo_input = folder.to_string_lossy().to_string();
+                        }
+                    }
+                    if enter_commit || save_clicked {
+                        let s = self.comfy_repo_input.trim();
+                        if !s.is_empty() {
+                            let dir = std::path::Path::new(s);
+                            let has_main = dir.is_dir() && dir.join("main.py").exists();
+                            if has_main {
+                                self.comfy.config_mut().repo_path = Some(dir.to_path_buf());
+                            }
+                        }
+                    }
+                });
+                // Basic validation feedback
+                let path_str = self.comfy_repo_input.trim();
+                if path_str.is_empty() {
+                    ui.colored_label(egui::Color32::GRAY, "Path not set");
+                } else {
+                    let dir = std::path::Path::new(path_str);
+                    if !dir.is_dir() {
+                        ui.colored_label(egui::Color32::RED, "Folder does not exist");
+                    } else if !dir.join("main.py").exists() {
+                        ui.colored_label(egui::Color32::YELLOW, "Selected folder does not contain main.py");
+                    } else {
+                        ui.colored_label(egui::Color32::GREEN, "OK");
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Python");
+                    let mut py = self.comfy.config().python_cmd.clone();
+                    if ui.text_edit_singleline(&mut py).changed() {
+                        self.comfy.config_mut().python_cmd = py;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Port");
+                    let mut p = self.comfy.config().port as i32;
+                    if ui.add(egui::DragValue::new(&mut p).clamp_range(1024..=65535)).changed() {
+                        self.comfy.config_mut().port = p.clamp(1024, 65535) as u16;
+                    }
+                    let in_use = self.comfy.is_port_open();
+                    if in_use {
+                        ui.colored_label(egui::Color32::YELLOW, "Port in use");
+                    }
+                });
+                ui.collapsing("Installation", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Install Dir");
+                        let _ = ui.text_edit_singleline(&mut self.comfy_install_dir_input);
+                        if ui.small_button("Browse…").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                self.comfy_install_dir_input = folder.to_string_lossy().to_string();
+                            }
+                        }
+                    });
+                    let dir = std::path::Path::new(self.comfy_install_dir_input.trim());
+                    if !dir.exists() {
+                        ui.colored_label(egui::Color32::GRAY, "Dir will be created");
+                    }
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.comfy_install_ffmpeg, "Install FFmpeg (system)")
+                            .on_hover_text("Best-effort install via your OS package manager (brew/winget/choco/apt/etc.)");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Python for venv");
+                        ui.text_edit_singleline(&mut self.comfy_venv_python_input)
+                            .on_hover_text("Optional: interpreter to create .venv (prefer Python 3.11/3.12)");
+                    });
+                    ui.collapsing("pip settings", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Index URL");
+                            ui.text_edit_singleline(&mut self.pip_index_url_input)
+                                .on_hover_text("e.g., https://pypi.org/simple or a local mirror");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Extra Index URL");
+                            ui.text_edit_singleline(&mut self.pip_extra_index_url_input)
+                                .on_hover_text("additional package index to search");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Trusted hosts");
+                            ui.text_edit_singleline(&mut self.pip_trusted_hosts_input)
+                                .on_hover_text("comma-separated hostnames (e.g., pypi.org,files.pythonhosted.org)");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Proxy URL");
+                            ui.text_edit_singleline(&mut self.pip_proxy_input)
+                                .on_hover_text("e.g., http://user:pass@proxy:port");
+                        });
+                        ui.checkbox(&mut self.pip_no_cache, "No cache")
+                            .on_hover_text("Pass --no-cache-dir to pip");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Torch Backend");
+                        egui::ComboBox::from_id_source("torch_backend")
+                            .selected_text(match self.comfy_torch_backend {
+                                crate::comfyui::TorchBackend::Auto => "Auto",
+                                crate::comfyui::TorchBackend::Cuda => "CUDA",
+                                crate::comfyui::TorchBackend::Mps => "MPS",
+                                crate::comfyui::TorchBackend::Rocm => "ROCm",
+                                crate::comfyui::TorchBackend::Cpu => "CPU",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.comfy_torch_backend, crate::comfyui::TorchBackend::Auto, "Auto");
+                                ui.selectable_value(&mut self.comfy_torch_backend, crate::comfyui::TorchBackend::Cuda, "CUDA");
+                                ui.selectable_value(&mut self.comfy_torch_backend, crate::comfyui::TorchBackend::Mps, "MPS");
+                                ui.selectable_value(&mut self.comfy_torch_backend, crate::comfyui::TorchBackend::Rocm, "ROCm");
+                                ui.selectable_value(&mut self.comfy_torch_backend, crate::comfyui::TorchBackend::Cpu, "CPU");
+                            });
+                    });
+                    ui.checkbox(&mut self.comfy_recreate_venv, "Recreate venv (.venv) using Python for venv")
+                        .on_hover_text("Deletes and recreates .venv to switch Python versions (useful when upgrading/downgrading)");
+                    ui.horizontal(|ui| {
+                        if ui.button("Install / Repair").clicked() {
+                            let mut plan = crate::comfyui::InstallerPlan::default();
+                            let s = self.comfy_install_dir_input.trim();
+                            if !s.is_empty() { plan.install_dir = Some(std::path::PathBuf::from(s)); }
+                            plan.torch_backend = self.comfy_torch_backend;
+                            let p = self.comfy_venv_python_input.trim();
+                            if !p.is_empty() { plan.python_for_venv = Some(p.to_string()); }
+                            plan.recreate_venv = self.comfy_recreate_venv;
+                            plan.install_ffmpeg = self.comfy_install_ffmpeg;
+                            // pip config
+                            let mut trusted: Vec<String> = Vec::new();
+                            for t in self.pip_trusted_hosts_input.split(',') { let tt = t.trim(); if !tt.is_empty() { trusted.push(tt.to_string()); } }
+                            plan.pip.index_url = if self.pip_index_url_input.trim().is_empty() { None } else { Some(self.pip_index_url_input.trim().to_string()) };
+                            plan.pip.extra_index_url = if self.pip_extra_index_url_input.trim().is_empty() { None } else { Some(self.pip_extra_index_url_input.trim().to_string()) };
+                            plan.pip.trusted_hosts = trusted;
+                            plan.pip.proxy = if self.pip_proxy_input.trim().is_empty() { None } else { Some(self.pip_proxy_input.trim().to_string()) };
+                            plan.pip.no_cache = self.pip_no_cache;
+                            self.comfy.install(plan);
+                        }
+                        if ui.button("Validate").clicked() {
+                            self.comfy.validate_install();
+                        }
+                        if ui.button("Use Installed").clicked() {
+                            self.comfy.use_installed();
+                            if let Some(p) = self.comfy.config().repo_path.as_ref() {
+                                self.comfy_repo_input = p.to_string_lossy().to_string();
+                            }
+                        }
+                        if ui.button("Uninstall").clicked() {
+                            self.comfy.uninstall();
+                        }
+                        if ui.button("Repair Missing Packages").clicked() {
+                            self.comfy.repair_common_packages();
+                        }
+                    });
+                    ui.small("Installer creates a reusable .venv in the selected directory. It will NOT re-create it on Start.");
+                });
+                let running = self.comfy.is_running();
+                // Enable Start only when repo looks valid and python cmd is non-empty
+                let repo_dir_valid = {
+                    let s = self.comfy_repo_input.trim();
+                    !s.is_empty() && std::path::Path::new(s).is_dir() && std::path::Path::new(s).join("main.py").exists()
+                };
+                let py_ok = !self.comfy.config().python_cmd.trim().is_empty();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!running && repo_dir_valid && py_ok, egui::Button::new("Start ComfyUI")).clicked() {
+                        // Commit the repo path from the input before starting
+                        let s = self.comfy_repo_input.trim();
+                        if !s.is_empty() {
+                            self.comfy.config_mut().repo_path = Some(std::path::PathBuf::from(s));
+                        }
+                        self.comfy.start();
+                        // If embedding is enabled and host not created, create and navigate now
+                        if self.comfy_embed_inside && self.comfy_webview.is_none() {
+                            if let Some(mut host) = crate::embed_webview::create_platform_host() {
+                                if self.comfy_devtools { host.set_devtools(true); }
+                                host.navigate(&self.comfy.url());
+                                host.set_visible(true);
+                                self.comfy_webview = Some(host);
+                                self.comfy_embed_logs.push_back("Embedded view created".into());
+                            } else {
+                                self.comfy_embed_inside = false; // disable switch when not available
+                                let reason = if cfg!(not(all(target_os = "macos", feature = "embed-webview"))) {
+                                    "feature flag not active; rebuild with --features embed-webview"
+                                } else { "no NSWindow contentView found; focus the app window and try again" };
+                                self.comfy_embed_logs.push_back(format!("Failed to create embedded view ({})", reason));
+                            }
+                        }
+                    }
+                    if ui.add_enabled(running, egui::Button::new("Open Window")).clicked() {
+                        self.comfy.open_webview_window();
+                    }
+                    if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                        self.comfy.stop();
+                        if let Some(mut host) = self.comfy_webview.take() { host.close(); }
+                        self.comfy_embed_logs.push_back("Embedded view closed".into());
+                    }
+                });
+                ui.label(format!("Status: {:?}", self.comfy.last_status));
+                if let Some(err) = &self.comfy.last_error { ui.colored_label(egui::Color32::RED, err); }
+                // Inline embed removed; see bottom dock panel for embedded view rendering.
+                ui.collapsing("Logs", |ui| {
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for line in self.comfy.logs(500) { ui.monospace(line); }
+                        });
+                });
+                ui.collapsing("Embedded View Logs", |ui| {
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            while self.comfy_embed_logs.len() > 200 { self.comfy_embed_logs.pop_front(); }
+                            for line in self.comfy_embed_logs.iter() { ui.monospace(line); }
+                        });
+                });
+                ui.collapsing("Auto-import Logs", |ui| {
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            while self.comfy_import_logs.len() > 400 { self.comfy_import_logs.pop_front(); }
+                            for line in self.comfy_import_logs.iter() { ui.monospace(line); }
+                        });
+                });
+                if ui.small_button("Open in Browser").clicked() {
+                    let _ = webbrowser::open(&self.comfy.url());
+                }
+            }
             egui::Separator::default().ui(ui);
             let assets = self.assets();
             egui_extras::TableBuilder::new(ui)
@@ -670,6 +1454,7 @@ impl eframe::App for App {
                             });
                         });
                     }
+                });
                 });
         });
 
@@ -790,6 +1575,11 @@ impl eframe::App for App {
             }
         });
 
+        // No floating window: when not embedding in assets, ensure any host is closed.
+        if !(self.comfy_embed_inside && self.comfy_embed_in_assets) {
+            if let Some(mut host) = self.comfy_webview.take() { host.close(); }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::Resize::default()
                 .id_salt("preview_resize")
@@ -803,11 +1593,48 @@ impl eframe::App for App {
             // Performance indicator
             ui.horizontal(|ui| {
             ui.heading("Timeline");
+                // Track controls
+                if ui.small_button("+ Video Track").clicked() {
+                    // Insert new video track at the top
+                    let binding = timeline_crate::TrackBinding {
+                        id: timeline_crate::TrackId::new(),
+                        name: String::new(),
+                        kind: timeline_crate::TrackKind::Video,
+                        node_ids: Vec::new(),
+                    };
+                    self.seq.graph.tracks.insert(0, binding);
+                    self.sync_tracks_from_graph();
+                    let _ = self.save_project_timeline();
+                }
+                if ui.small_button("+ Audio Track").clicked() {
+                    let binding = timeline_crate::TrackBinding { id: timeline_crate::TrackId::new(), name: String::new(), kind: timeline_crate::TrackKind::Audio, node_ids: Vec::new() };
+                    let _ = self.apply_timeline_command(timeline_crate::TimelineCommand::UpsertTrack { track: binding });
+                    let _ = self.save_project_timeline();
+                }
+                if ui.small_button("− Last Video").clicked() {
+                    if let Some((idx, id)) = self.seq.graph.tracks.iter().enumerate().rev().find_map(|(i,t)| match t.kind { timeline_crate::TrackKind::Video => Some((i,t.id)), _=>None }) {
+                        let _ = self.apply_timeline_command(timeline_crate::TimelineCommand::RemoveTrack { track_id: id });
+                        let _ = self.save_project_timeline();
+                    }
+                }
+                if ui.small_button("− Last Audio").clicked() {
+                    if let Some((idx, id)) = self.seq.graph.tracks.iter().enumerate().rev().find_map(|(i,t)| match t.kind { timeline_crate::TrackKind::Audio => Some((i,t.id)), _=>None }) {
+                        let _ = self.apply_timeline_command(timeline_crate::TimelineCommand::RemoveTrack { track_id: id });
+                        let _ = self.save_project_timeline();
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let cache_stats = format!("Cache: {}/{} hits", 
-                                            self.preview.cache_hits, 
-                                            self.preview.cache_hits + self.preview.cache_misses);
+                    // Autosave indicator
+                    if let Some(t) = self.last_save_at {
+                        let ago = Instant::now().saturating_duration_since(t);
+                        let label = if ago.as_secs_f32() < 2.0 { "Saved".to_string() } else { format!("Autosave {}s ago", ago.as_secs()) };
+                        ui.small(label);
+                    }
+                    let cache_stats = format!("Cache: {}/{} hits",
+                        self.preview.cache_hits,
+                        self.preview.cache_hits + self.preview.cache_misses);
                     ui.small(&cache_stats);
+                    if ui.small_button("Save Project").clicked() { let _ = self.save_project_timeline(); }
                 });
             });
             

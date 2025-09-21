@@ -1,0 +1,10 @@
+[package]
+name = "comfywebview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+wry = "0.45"
+tao = "0.27"

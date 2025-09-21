@@ -50,7 +50,22 @@ fn node_frame_range(node: &TimelineNode) -> Option<FrameRange> {
 
 fn clip_source(binding: &timeline_crate::TrackBinding, clip: &ClipNode) -> Option<VisualSource> {
     let path = clip.asset_id.clone()?;
-    let is_image = matches!(binding.kind, TrackKind::Custom(ref id) if id == "image");
+    // Detect images by extension or by explicit image track kind
+    let ext_is_image = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("png")
+            || s.eq_ignore_ascii_case("jpg")
+            || s.eq_ignore_ascii_case("jpeg")
+            || s.eq_ignore_ascii_case("gif")
+            || s.eq_ignore_ascii_case("webp")
+            || s.eq_ignore_ascii_case("bmp")
+            || s.eq_ignore_ascii_case("tif")
+            || s.eq_ignore_ascii_case("tiff")
+            || s.eq_ignore_ascii_case("exr"))
+        .unwrap_or(false);
+    let track_hint_image = matches!(binding.kind, TrackKind::Custom(ref id) if id == "image");
+    let is_image = ext_is_image || track_hint_image;
     Some(VisualSource { path, is_image })
 }
 
