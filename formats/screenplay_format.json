@@ -1,0 +1,218 @@
+{
+  "title": "The Redemption Path",
+  "genre": "Thriller / Mystery",
+  "duration": 60,
+  "synopsis": "A disgraced detective confronts his past while investigating a series of murders that mirror his own unsolved case. As he closes in on the truth, he realizes redemption may demand a final sacrifice.",
+  "acts": [
+    {
+      "id": 1,
+      "title": "Act I – The Return",
+      "summary": "The detective, haunted by his past, returns to the city after years away when a new case mirrors the one that ended his career.",
+      "shots": [
+        {
+          "id": 1,
+          "title": "Opening Establishing Shot",
+          "visual_description": "A rain-soaked city skyline at night, neon lights reflecting off puddles as the camera glides toward a flickering sign reading 'POLICE DEPARTMENT'.",
+          "location": "Downtown, exterior",
+          "characters": [],
+          "duration": 8.0,
+          "camera": {
+          "movement": "slow aerial push-in",
+          "angle": "wide shot"
+        },
+        "workflow": {
+          "key": "default-image-887b94cc",
+          "inputs": {
+            "batch_size": 2,
+            "cfg": 8,
+            "ckpt_name": "opening_city",
+            "denoise": 0.45,
+            "height": 832,
+            "sampler_name": "default",
+            "scheduler": "default",
+            "seed": 1234,
+            "steps": 40,
+            "text": "Rain-soaked city skyline at night, neon reflections gliding across puddles.",
+            "width": 1184
+          }
+        },
+        "workflow": {
+          "key": "runway-image-to-video-gen4-turbo-1234abcd",
+          "inputs": {
+            "prompt": "Rain-soaked city skyline at night, neon reflections gliding across puddles.",
+            "ratio": "1280:720"
+          }
+        },
+        "workflow": {
+          "key": "default-image-887b94cc",
+          "inputs": {
+            "batch_size": 2,
+            "cfg": 8,
+            "ckpt_name": "office_closeup",
+            "denoise": 0.4,
+            "height": 832,
+            "sampler_name": "default",
+            "scheduler": "default",
+            "seed": 5678,
+            "steps": 36,
+            "text": "Dimly lit detective office filled with smoke and old case files, close-up mood.",
+            "width": 1184
+          }
+        },
+        "sound": {
+          "music": "low atmospheric drone",
+          "fx": "rainfall, distant siren"
+        }
+      },
+        {
+          "id": 2,
+          "title": "The Detective's Office",
+          "visual_description": "Inside a dimly lit office filled with cigarette smoke and old case files. The detective sits in silence, staring at a faded photograph.",
+          "location": "Interior office",
+          "characters": ["Detective Harris"],
+          "duration": 12.0,
+          "camera": {
+            "movement": "static close-up",
+            "angle": "eye-level"
+          },
+          "sound": {
+            "music": "soft piano motif",
+            "dialogue": [
+              {
+                "character": "Detective Harris",
+                "line": "They say time heals all wounds... but some wounds rot instead."
+              }
+            ]
+          }
+        },
+        "workflow": {
+          "key": "default-image-887b94cc",
+          "inputs": {
+            "batch_size": 2,
+            "cfg": 7.5,
+            "ckpt_name": "call_to_action",
+            "denoise": 0.42,
+            "height": 832,
+            "sampler_name": "default",
+            "scheduler": "default",
+            "seed": 9012,
+            "steps": 38,
+            "text": "Police radio dispatch crackles as detective grabs coat and exits office.",
+            "width": 1184
+          }
+        },
+        {
+          "id": 3,
+          "title": "Call to Action",
+          "visual_description": "A police radio crackles to life with a dispatch about a new murder downtown. Harris grabs his coat and leaves.",
+          "location": "Interior office → hallway",
+          "characters": ["Detective Harris"],
+          "duration": 10.0,
+          "camera": {
+            "movement": "handheld follow",
+            "angle": "medium shot"
+          },
+          "sound": {
+            "fx": "radio chatter, footsteps, door creak"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Act II – The Descent",
+      "summary": "The detective investigates, uncovering that the killer is recreating his old case scene by scene.",
+      "shots": [
+        {
+          "id": 4,
+          "title": "Crime Scene Alley",
+          "visual_description": "Police tape flutters in the rain. Harris kneels beside a chalk outline that looks eerily familiar.",
+          "location": "Back alley",
+          "characters": ["Detective Harris", "Forensics Officer Kim"],
+          "duration": 14.0,
+          "camera": {
+            "movement": "slow pan",
+            "angle": "low tracking shot"
+          },
+          "sound": {
+            "fx": "camera flashes, thunder",
+            "dialogue": [
+              {
+                "character": "Kim",
+                "line": "Same pattern as before. Whoever did this studied your case files."
+              }
+            ]
+          },
+          "workflow": {
+            "key": "runway-image-to-video-gen4-turbo-1234abcd",
+            "inputs": {
+              "prompt": "Rain-soaked alley crime scene, detective kneeling by chalk outline with police tape fluttering.",
+              "ratio": "1280:720"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Act III – The Reckoning",
+      "summary": "Harris discovers the killer’s identity and faces his own moral breaking point in the process.",
+      "shots": [
+        {
+          "id": 5,
+          "title": "Final Confrontation",
+          "visual_description": "In an abandoned warehouse, Harris confronts the killer — a reflection of his former self. The rain outside grows heavier as sirens approach.",
+          "location": "Abandoned warehouse",
+          "characters": ["Detective Harris", "The Killer"],
+          "duration": 20.0,
+          "camera": {
+            "movement": "circling dolly shot",
+            "angle": "over-the-shoulder alternating"
+          },
+          "sound": {
+            "music": "crescendo leading to silence",
+            "dialogue": [
+              {
+                "character": "The Killer",
+                "line": "You wanted the truth, didn’t you? Then look at yourself!"
+              },
+              {
+                "character": "Harris",
+                "line": "I already have."
+              }
+            ]
+          },
+          "workflow": {
+            "key": "runway-image-to-video-gen4-turbo-1234abcd",
+            "inputs": {
+              "prompt": "Abandoned warehouse showdown between detective and killer, cinematic rain outside.",
+              "ratio": "1280:720"
+            }
+          }
+        },
+        {
+          "id": 6,
+          "title": "Closing Shot",
+          "visual_description": "Dawn breaks over the city as Harris walks away from the crime scene, blood on his hands, but peace in his eyes.",
+          "location": "Street, sunrise",
+          "characters": ["Detective Harris"],
+          "duration": 10.0,
+          "camera": {
+            "movement": "wide dolly pull-back",
+            "angle": "low angle silhouette"
+          },
+          "sound": {
+            "music": "melancholic orchestral resolution"
+          },
+          "workflow": {
+            "key": "runway-image-to-video-gen4-turbo-1234abcd",
+            "inputs": {
+              "prompt": "Dawn skyline as detective walks away from crime scene, soft sunrise glow.",
+              "ratio": "1280:720"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

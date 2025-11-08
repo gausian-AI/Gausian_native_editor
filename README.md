@@ -30,6 +30,11 @@ This README captures purpose/scope, current architecture, exact stack versions, 
   - encode_video (L4): NVENC encode frames → MP4; fallback to libx264
   - /health endpoint for connectivity checks
 
+## GStreamer decoder diagnostics (macOS)
+
+- To prioritize VideoToolbox decoders ahead of libav, set `GST_PLUGIN_FEATURE_RANK` before launching the desktop app, for example `export GST_PLUGIN_FEATURE_RANK="vtdec_h264:PRIMARY+1,vtdec_hevc:PRIMARY+1"`.
+- Set `GST_DECODER_DIAG=1` to emit a one-time log listing available decoder elements and their current rank—useful when debugging hardware vs. software selection.
+
 ## Stack and exact versions
 
 Rust workspace (see Cargo.toml):
@@ -72,6 +77,10 @@ Quick tour:
 Default behavior:
 - ComfyUI “Open inside editor” is OFF by default
 - New projects create 3 video + 3 audio baseline tracks (V1..V3, A1..A3)
+
+## Package the desktop app
+
+We bundle the native `desktop` binary with [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle). Install the CLI once (`cargo install cargo-bundle`), run a release build, then package per platform (macOS `.app`, Windows `.exe`, Linux `.deb`/AppImage). Detailed steps live in [docs/packaging.md](docs/packaging.md).
 
 ## How to run (Modal scaffold)
 

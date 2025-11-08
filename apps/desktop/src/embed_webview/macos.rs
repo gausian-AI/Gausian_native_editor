@@ -8,15 +8,13 @@ extern "C" {}
 use cocoa::appkit::{NSApp, NSView, NSWindow};
 use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::{NSPoint, NSRect, NSSize, NSString};
-use objc::class;
-use objc::runtime::Object;
-use objc::{msg_send, sel, sel_impl};
+use objc::{class, msg_send, sel, sel_impl};
+use serde_json;
 
 pub struct MacWebViewHost {
     webview: id,
     parent_view: id,
     visible: bool,
-    devtools: bool,
     last_url: Option<String>,
 }
 
@@ -125,68 +123,6 @@ impl WebViewHost for MacWebViewHost {
             let _: () = msg_send![self.webview, reload];
         }
     }
-    fn set_devtools(&mut self, enabled: bool) {
-        if self.devtools == enabled {
-            return;
-        }
-        self.devtools = enabled;
-        unsafe {
-            // Recreate with developer extras setting
-            let old_frame: NSRect = msg_send![self.webview, frame];
-            let _: () = msg_send![self.webview, removeFromSuperview];
-            let cfg: id = msg_send![class!(WKWebViewConfiguration), new];
-            if cfg != nil {
-                let key: id = NSString::alloc(nil).init_str("developerExtrasEnabled");
-                let prefs: id = msg_send![cfg, preferences];
-                if prefs != nil {
-                    let _: () =
-                        msg_send![prefs, setValue: if enabled { YES } else { NO } forKey: key];
-                }
-                let webview_alloc: id = msg_send![class!(WKWebView), alloc];
-                if webview_alloc != nil {
-                    let webview_new: id =
-                        msg_send![webview_alloc, initWithFrame: old_frame configuration: cfg];
-                    if webview_new != nil {
-                        self.webview = webview_new;
-                        let _: () = msg_send![self.parent_view, addSubview: self.webview positioned: 1 relativeTo: nil];
-                        if let Some(url) = self.last_url.clone() {
-                            Self::load_url(self.webview, &url);
-                        }
-                        let _: () =
-                            msg_send![self.webview, setHidden: if self.visible { NO } else { YES }];
-                    }
-                }
-            }
-        }
-    }
-    fn open_inspector(&mut self) -> bool {
-        // Best-effort: try private APIs if present; otherwise advise user to right-click → Inspect
-        unsafe {
-            // Ensure devtools are enabled
-            if !self.devtools {
-                self.set_devtools(true);
-            }
-            // Try KVC to get inspector object and call show
-            let key: id = NSString::alloc(nil).init_str("inspector");
-            let inspector: id = msg_send![self.webview, valueForKey: key];
-            if inspector != nil {
-                let _: () = msg_send![inspector, show];
-                return true;
-            }
-            // Try direct selector on webview
-            let can1: bool = msg_send![self.webview, respondsToSelector: sel!(showInspector:)];
-            if can1 {
-                let _: () = msg_send![self.webview, showInspector: nil];
-                return true;
-            }
-            let can2: bool = msg_send![self.webview, respondsToSelector: sel!(showWebInspector:)];
-            if can2 {
-                let _: () = msg_send![self.webview, showWebInspector: nil];
-                return true;
-            }
-        }
-        false
-    }
     fn is_visible(&self) -> bool {
         self.visible
     }
@@ -195,6 +131,53 @@ impl WebViewHost for MacWebViewHost {
             let _: () = msg_send![self.webview, removeFromSuperview];
         }
         self.visible = false;
+    }
+    fn focus(&mut self) {
+        unsafe {
+            let window: id = msg_send![self.parent_view, window];
+            if window != nil {
+                let _: () = msg_send![window, makeFirstResponder: self.webview];
+            }
+        }
+    }
+    fn paste_from_clipboard(&mut self) {
+        self.focus();
+        unsafe {
+            let _: () = msg_send![self.webview, paste: nil];
+        }
+    }
+    fn insert_text(&mut self, text: &str) {
+        self.focus();
+        let Ok(json_text) = serde_json::to_string(text) else {
+            return;
+        };
+        let script = format!(
+            "(function() {{
+                const text = {json};
+                const active = document.activeElement;
+                if (!active) return;
+                if (typeof active.value === 'string' && active !== document.body) {{
+                    const start = active.selectionStart ?? active.value.length;
+                    const end = active.selectionEnd ?? start;
+                    const value = active.value;
+                    active.value = value.slice(0, start) + text + value.slice(end);
+                    const pos = start + text.length;
+                    if (typeof active.setSelectionRange === 'function') {{
+                        active.setSelectionRange(pos, pos);
+                    }}
+                    active.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    active.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }} else {{
+                    document.execCommand('insertText', false, text);
+                }}
+            }})();",
+            json = json_text,
+        );
+        unsafe {
+            let ns_script = NSString::alloc(nil).init_str(&script);
+            let _: () =
+                msg_send![self.webview, evaluateJavaScript: ns_script completionHandler: nil];
+        }
     }
 }
 
@@ -213,10 +196,10 @@ pub fn create_host() -> Option<Box<dyn WebViewHost>> {
             webview,
             parent_view: parent,
             visible: false,
-            devtools: false,
             last_url: None,
         };
         host.set_visible(true);
+        host.focus();
         Some(Box::new(host))
     }
 }

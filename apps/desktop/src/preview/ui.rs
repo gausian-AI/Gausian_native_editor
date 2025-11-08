@@ -1,14 +1,19 @@
 use eframe::egui;
 
 use crate::decode::{DecodeCmd, FramePayload, PlayState};
+use crate::gpu::readback::{ReadbackResult, ReadbackTag};
+use crate::gpu::sync::PlaybackPhase;
 use crate::preview::state::upload_plane;
 use crate::preview::{visual_source_at, PreviewShaderMode, PreviewState, StreamMetadata};
+use crate::proxy_queue::ProxyReason;
 use crate::App;
+use anyhow::Context;
 use image::GenericImageView;
 use renderer::{
     convert_yuv_to_rgba, ColorSpace as RenderColorSpace, PixelFormat as RenderPixelFormat,
 };
-use tracing::trace;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{info, trace};
 
 fn fit_rect_to_content(rect: egui::Rect, content_w: f32, content_h: f32) -> egui::Rect {
     if content_w <= 0.0 || content_h <= 0.0 {
@@ -101,6 +106,7 @@ impl App {
             h = avail.y;
             w = (h * 16.0 / 9.0).round();
         }
+        let scale_factor = self.viewer_scale.factor();
 
         // Playback progression handled by PlaybackClock (no speed-up)
 
@@ -117,6 +123,13 @@ impl App {
         let (rect, _resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(12, 12, 12));
+        let video_rect = if scale_factor < 1.0 {
+            let draw_w = (rect.width() * scale_factor).max(160.0);
+            let draw_h = (rect.height() * scale_factor).max(90.0);
+            egui::Rect::from_center_size(rect.center(), egui::vec2(draw_w, draw_h))
+        } else {
+            rect
+        };
 
         if matches!(self.engine.state, PlayState::Playing) {
             self.last_seek_request_at = None;
@@ -155,7 +168,7 @@ impl App {
             );
             return;
         };
-        if frame.wgpu_render_state().is_none() {
+        let Some(rs) = frame.wgpu_render_state() else {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -164,7 +177,24 @@ impl App {
                 egui::Color32::GRAY,
             );
             return;
-        }
+        };
+
+        let phase = match self.engine.state {
+            PlayState::Playing => PlaybackPhase::PlayingRealtime,
+            PlayState::Scrubbing | PlayState::Seeking => PlaybackPhase::ScrubbingOrSeeking,
+            PlayState::Paused => PlaybackPhase::Paused,
+        };
+        self.preview.update_gpu_phase(rs, phase);
+        let Some(gpu_ctx) = self.preview.gpu_context(rs) else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "GPU sync unavailable",
+                egui::FontId::proportional(16.0),
+                egui::Color32::GRAY,
+            );
+            return;
+        };
 
         // Special-case images: render directly without video decode/seek
         if src.is_image {
@@ -179,7 +209,7 @@ impl App {
                 match image::open(&src.path) {
                     Ok(mut img) => {
                         let (orig_w, orig_h) = img.dimensions();
-                        let fitted = fit_rect_to_content(rect, orig_w as f32, orig_h as f32);
+                        let fitted = fit_rect_to_content(video_rect, orig_w as f32, orig_h as f32);
                         let target_w = fitted.width().max(1.0).round() as u32;
                         let target_h = fitted.height().max(1.0).round() as u32;
                         if (target_w, target_h) != (orig_w, orig_h) {
@@ -216,18 +246,50 @@ impl App {
             }
             if let Some(tex) = &self.preview.texture {
                 let size = tex.size();
-                let dest = fit_rect_to_content(rect, size[0] as f32, size[1] as f32);
+                let dest = fit_rect_to_content(video_rect, size[0] as f32, size[1] as f32);
                 let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                 painter.image(tex.id(), dest, uv, egui::Color32::WHITE);
             }
             return;
         }
 
-        let (active_path, media_t) = self
+        let (timeline_path, media_t) = self
             .active_video_media_time_graph(t_playhead)
             .unwrap_or_else(|| (src.path.clone(), t_playhead));
+        let playback = self.determine_playback_path(&timeline_path);
+        if let (Some(asset), Some(reason)) = (playback.asset.as_ref(), playback.queue_reason) {
+            self.queue_proxy_for_asset(asset, reason, matches!(reason, ProxyReason::Mode));
+        }
+        let active_path = playback.decode_path.clone();
+        let using_proxy = playback.using_proxy;
+        let using_optimized = playback.using_optimized;
+        let active_asset = playback.asset.clone();
+        let clip_id = active_asset
+            .as_ref()
+            .map(|a| a.id.as_str())
+            .unwrap_or("<unknown>");
+        let tier = if using_optimized {
+            "optimized"
+        } else if using_proxy {
+            "proxy"
+        } else {
+            "original"
+        };
+        let log_key = format!("{}::{}", active_path, tier);
+        if self.preview.last_logged_playback.as_ref() != Some(&log_key) {
+            info!(
+                "[preview] playback_start clip={} tier={} path={} t={:.3}",
+                clip_id, tier, active_path, media_t
+            );
+            self.preview.last_logged_playback = Some(log_key.clone());
+            self.preview.last_interactive_request = None;
+        }
         self.engine.target_pts = media_t;
-        self.decode_mgr.ensure_worker(&active_path, ctx);
+        self.decode_mgr.ensure_worker(
+            &active_path,
+            active_asset.as_ref().map(|a| a.id.as_str()),
+            ctx,
+        );
 
         // Debounce decode commands
         let fps_seq = (self.seq.fps.num.max(1) as f64) / (self.seq.fps.den.max(1) as f64);
@@ -247,6 +309,7 @@ impl App {
         let epsilon = (0.25 * frame_dur).max(0.010);
 
         // Dispatch commands based on state with epsilon gating.
+        let mut lagging_frame = false;
         match self.engine.state {
             PlayState::Playing => {
                 // Always send initial Play on state/path change
@@ -433,7 +496,7 @@ impl App {
             self.last_seek_request_at = None;
         }
 
-        if let Some(frame_out) = picked {
+        if let Some(frame_out) = picked.as_ref() {
             // Clear seeking timer when we have a frame in paused/scrubbing
             if !matches!(self.engine.state, PlayState::Playing) {
                 self.last_seek_request_at = None;
@@ -448,6 +511,10 @@ impl App {
             // Re-anchor while playing if preview drifts from playhead beyond tolerance.
             if matches!(self.engine.state, PlayState::Playing) {
                 let dt = (frame_out.pts - media_t).abs();
+                let frame_budget = frame_dur.max(1.0 / 60.0);
+                if dt > frame_budget * 1.25 {
+                    lagging_frame = true;
+                }
                 let cooldown_ok = self
                     .last_play_reanchor_time
                     .map(|t| t.elapsed().as_millis() >= 150)
@@ -464,10 +531,10 @@ impl App {
                 }
             }
             if let FramePayload::Cpu { y, uv } = &frame_out.payload {
-                if let Some(rs) = frame.wgpu_render_state() {
+                {
                     let mut renderer = rs.renderer.write();
                     let slot = self.preview.ensure_stream_slot(
-                        &rs.device,
+                        &gpu_ctx,
                         &mut renderer,
                         StreamMetadata {
                             stream_id: active_path.clone(),
@@ -492,28 +559,33 @@ impl App {
                             y.as_ref(),
                             uv.as_ref(),
                         ) {
-                            upload_plane(
-                                &rs.queue,
-                                &**out_tex,
-                                &rgba,
-                                frame_out.props.w,
-                                frame_out.props.h,
-                                (frame_out.props.w as usize) * 4,
-                                4,
-                            );
-                            if let Some(id) = slot.egui_tex_id {
-                                renderer.update_egui_texture_from_wgpu_texture(
-                                    &rs.device,
-                                    out_view,
-                                    eframe::wgpu::FilterMode::Linear,
-                                    id,
+                            gpu_ctx.with_queue(|queue| {
+                                upload_plane(
+                                    queue,
+                                    &**out_tex,
+                                    &rgba,
+                                    frame_out.props.w,
+                                    frame_out.props.h,
+                                    (frame_out.props.w as usize) * 4,
+                                    4,
                                 );
+                            });
+                            if let Some(id) = slot.egui_tex_id {
+                                gpu_ctx.with_device(|device| {
+                                    renderer.update_egui_texture_from_wgpu_texture(
+                                        device,
+                                        out_view,
+                                        eframe::wgpu::FilterMode::Linear,
+                                        id,
+                                    );
+                                });
+                                crate::gpu_pump!(&gpu_ctx, "ui_present_upload");
                                 let uv_rect = egui::Rect::from_min_max(
                                     egui::pos2(0.0, 0.0),
                                     egui::pos2(1.0, 1.0),
                                 );
                                 let dest = fit_rect_to_content(
-                                    rect,
+                                    video_rect,
                                     frame_out.props.w as f32,
                                     frame_out.props.h as f32,
                                 );
@@ -521,6 +593,12 @@ impl App {
                                 trace!("preview presented frame");
                                 // Update last presented pts for hybrid clearing heuristic
                                 self.last_present_pts = Some((active_path.clone(), frame_out.pts));
+                            }
+                            if matches!(
+                                self.engine.state,
+                                PlayState::Scrubbing | PlayState::Seeking
+                            ) {
+                                self.preview.request_scrub_readback();
                             }
                         }
                     }
@@ -530,7 +608,7 @@ impl App {
             let mut drew_previous = false;
             if let Some(slot) = self.preview.stream.as_ref() {
                 if let (Some(id), w, h) = (slot.egui_tex_id, slot.width, slot.height) {
-                    let dest = fit_rect_to_content(rect, w as f32, h as f32);
+                    let dest = fit_rect_to_content(video_rect, w as f32, h as f32);
                     let uv_rect =
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                     painter.image(id, dest, uv_rect, egui::Color32::WHITE);
@@ -555,6 +633,25 @@ impl App {
             }
         }
 
+        if matches!(self.engine.state, PlayState::Playing) && picked.is_none() {
+            lagging_frame = true;
+        }
+
+        self.update_playback_adaptive(
+            lagging_frame,
+            frame_dur,
+            active_asset.as_ref(),
+            using_proxy || using_optimized,
+        );
+
+        if lagging_frame {
+            self.preview.interactive_policy.note_lag(
+                true,
+                self.engine.state,
+                std::time::Instant::now(),
+            );
+        }
+
         // Lightweight debug overlay: resolved source path and media time, plus lock indicator
         // Determine displayed pts if any
         let latest = self.decode_mgr.take_latest(&active_path);
@@ -564,12 +661,22 @@ impl App {
         let locked = diff
             .map(|d| d <= (0.5 * frame_dur).max(0.015))
             .unwrap_or(false);
+        let source_suffix = if using_optimized {
+            " [optimized]"
+        } else if using_proxy {
+            " [proxy]"
+        } else {
+            ""
+        };
         let overlay = format!(
-            "src: {}\nmedia_t: {:.3}s  state: {:?}  {}\nlock: {}{}",
-            std::path::Path::new(&active_path)
+            "src: {}{} (scale {}, mode {})\nmedia_t: {:.3}s  state: {:?}  {}\nlock: {}{}",
+            std::path::Path::new(&timeline_path)
                 .file_name()
-                .and_then(|s| Some(s.to_string_lossy().to_string()))
-                .unwrap_or(active_path.clone()),
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(timeline_path.clone()),
+            source_suffix,
+            self.viewer_scale.label(),
+            self.effective_proxy_mode().display_name(),
             media_t,
             self.engine.state,
             if displayed_approx { "approx" } else { "" },
@@ -584,5 +691,133 @@ impl App {
             egui::FontId::monospace(11.0),
             egui::Color32::from_gray(180),
         );
+
+        if self.preview.last_play_state_for_readback != Some(self.engine.state) {
+            if matches!(self.engine.state, PlayState::Paused) {
+                self.preview.request_capture_readback();
+            }
+            self.preview.last_play_state_for_readback = Some(self.engine.state);
+        }
+
+        self.preview.process_readback(&gpu_ctx, self.engine.state);
+
+        if let Some(stats) = self.decode_mgr.worker_stats_snapshot(&active_path) {
+            self.preview
+                .interactive_policy
+                .note_first_frame_ms(stats.first_frame_ms);
+        }
+
+        let desired_interactive = self.preview.interactive_policy.evaluate(
+            clip_id,
+            tier,
+            self.engine.state,
+            std::time::Instant::now(),
+        );
+
+        if self.preview.last_interactive_request != Some(desired_interactive) {
+            let reason = if desired_interactive {
+                match self.engine.state {
+                    PlayState::Scrubbing | PlayState::Seeking => "scrub",
+                    PlayState::Playing => "playback_start",
+                    PlayState::Paused => "paused",
+                }
+            } else if matches!(self.engine.state, PlayState::Paused) {
+                "paused"
+            } else if tier != "original" {
+                "proxy"
+            } else {
+                "realtime"
+            };
+            info!(
+                "[interactive] request clip={} interactive={} reason={}",
+                clip_id, desired_interactive, reason
+            );
+            self.preview.last_interactive_request = Some(desired_interactive);
+        }
+
+        self.decode_mgr.set_interactive(
+            &active_path,
+            active_asset.as_ref().map(|a| a.id.as_str()),
+            desired_interactive,
+        );
+
+        let readback_results = self.preview.take_readback_results();
+        if !readback_results.is_empty() {
+            self.handle_preview_readback_results(readback_results);
+        }
+    }
+
+    fn handle_preview_readback_results(&mut self, results: Vec<ReadbackResult>) {
+        for result in results {
+            match result.tag {
+                ReadbackTag::Capture => {
+                    if let Err(err) = self.persist_preview_capture(&result) {
+                        tracing::error!(
+                            target = "preview_readback",
+                            error = %err,
+                            "failed to persist preview capture"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn persist_preview_capture(&mut self, result: &ReadbackResult) -> anyhow::Result<()> {
+        let capture_root = std::env::temp_dir().join("gausian_preview");
+        std::fs::create_dir_all(&capture_root).with_context(|| {
+            format!(
+                "create preview capture directory {}",
+                capture_root.display()
+            )
+        })?;
+
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let filename = format!(
+            "preview_capture_{}_{}x{}.png",
+            timestamp_ns, result.extent.width, result.extent.height
+        );
+        let path = capture_root.join(filename);
+
+        let width = result.extent.width as usize;
+        let height = result.extent.height as usize;
+        let row_pitch = result.bytes_per_row as usize;
+        let mut rgba = vec![0u8; width * height * 4];
+        for row in 0..height {
+            let src_off = row * row_pitch;
+            let dst_off = row * width * 4;
+            rgba[dst_off..dst_off + width * 4]
+                .copy_from_slice(&result.pixels[src_off..src_off + width * 4]);
+        }
+
+        image::save_buffer(
+            &path,
+            &rgba,
+            result.extent.width,
+            result.extent.height,
+            image::ColorType::Rgba8,
+        )
+        .with_context(|| format!("failed to write preview capture {}", path.display()))?;
+
+        self.preview_last_capture = Some(crate::PreviewCapture {
+            path: path.clone(),
+            timestamp: std::time::Instant::now(),
+            width: result.extent.width,
+            height: result.extent.height,
+        });
+
+        tracing::info!(
+            target = "preview_readback",
+            path = %path.display(),
+            width = result.extent.width,
+            height = result.extent.height,
+            "preview capture saved"
+        );
+
+        Ok(())
     }
 }

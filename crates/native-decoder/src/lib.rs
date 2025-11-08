@@ -4,6 +4,7 @@
 //! It supports both CPU plane copies (Phase 1) and zero-copy via IOSurface (Phase 2).
 
 use anyhow::Result;
+use tracing::info;
 // Define YUV pixel formats locally to avoid cyclic dependency
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum YuvPixFmt {
@@ -32,6 +33,11 @@ mod fallback;
 #[cfg(feature = "gstreamer")]
 mod gstreamer_backend;
 
+#[cfg(feature = "gstreamer")]
+pub use gstreamer_backend::{
+    build_platform_accelerated_pipeline, select_best_decoder, DecoderSelection,
+};
+
 mod wgpu_integration;
 
 /// Video frame data with YUV planes
@@ -55,6 +61,11 @@ pub struct IOSurfaceFrame {
     pub height: u32,
     pub timestamp: f64,
 }
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for IOSurfaceFrame {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for IOSurfaceFrame {}
 
 /// Native video decoder trait
 pub trait NativeVideoDecoder: Send + Sync {
@@ -108,6 +119,11 @@ pub trait NativeVideoDecoder: Send + Sync {
     fn seek_to_keyframe(&mut self, timestamp: f64) -> Result<()> {
         self.seek_to(timestamp)
     }
+
+    /// Toggle interactive (reduced-quality) mode. Default: no-op.
+    fn set_interactive(&mut self, _interactive: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Video properties
@@ -141,11 +157,33 @@ impl Default for DecoderConfig {
     }
 }
 
+/// Return a descriptive string for the decoder the runtime will use.
+pub fn describe_platform_decoder() -> Result<String> {
+    #[cfg(feature = "gstreamer")]
+    {
+        return gstreamer_backend::describe_platform_decoder();
+    }
+
+    #[cfg(all(not(feature = "gstreamer"), target_os = "macos"))]
+    {
+        return Ok("VideoToolbox hardware decoder (Apple VideoToolbox)".to_string());
+    }
+
+    #[cfg(all(not(feature = "gstreamer"), not(target_os = "macos")))]
+    {
+        return Ok("Software fallback decoder (FFmpeg/libavcodec)".to_string());
+    }
+
+    #[allow(unreachable_code)]
+    Ok("Unknown decoder configuration".to_string())
+}
+
 /// Create a native video decoder for the given file
 pub fn create_decoder<P: AsRef<Path>>(
     path: P,
     config: DecoderConfig,
 ) -> Result<Box<dyn NativeVideoDecoder>> {
+    let path_buf = path.as_ref().to_path_buf();
     // If the GStreamer feature is enabled, prefer it on all platforms for evaluation.
     #[cfg(feature = "gstreamer")]
     {
@@ -153,19 +191,39 @@ pub fn create_decoder<P: AsRef<Path>>(
         {
             // Keep VT path when zero_copy requested to preserve IOSurface integration.
             if config.zero_copy {
-                return macos::create_videotoolbox_decoder(path, config);
+                info!(
+                    path = %path_buf.display(),
+                    zero_copy = config.zero_copy,
+                    "native decoder: VideoToolbox (zero-copy) selected"
+                );
+                return macos::create_videotoolbox_decoder(&path_buf, config);
             }
         }
-        return gstreamer_backend::create_gst_decoder(path, config);
+        info!(
+            path = %path_buf.display(),
+            hw = config.hardware_acceleration,
+            zero_copy = config.zero_copy,
+            "native decoder: GStreamer backend selected"
+        );
+        return gstreamer_backend::create_gst_decoder(&path_buf, config);
     }
     #[cfg(target_os = "macos")]
     {
-        macos::create_videotoolbox_decoder(path, config)
+        info!(
+            path = %path_buf.display(),
+            zero_copy = config.zero_copy,
+            "native decoder: VideoToolbox selected"
+        );
+        macos::create_videotoolbox_decoder(&path_buf, config)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        fallback::create_fallback_decoder(path, config)
+        info!(
+            path = %path_buf.display(),
+            "native decoder: software fallback selected"
+        );
+        fallback::create_fallback_decoder(&path_buf, config)
     }
 }
 

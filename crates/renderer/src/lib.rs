@@ -6,7 +6,13 @@ use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 mod cpu;
+mod preview;
+
 pub use cpu::convert_yuv_to_rgba;
+pub use preview::{
+    CpuFrame, CpuPixelFormat, PreviewDownscale, PreviewFrameInput, PreviewGpuSync,
+    PreviewReadbackResources, PreviewTextureSource,
+};
 
 #[derive(Debug, Error)]
 pub enum RendererError {
@@ -44,6 +50,8 @@ pub struct Renderer {
     // Vertex buffer for full-screen quad
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+
+    preview_readback: PreviewReadbackResources,
 }
 
 #[repr(C)]
@@ -100,7 +108,7 @@ pub struct RenderParams {
     pub color_space: ColorSpace,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PixelFormat {
     Rgba8,
     Bgra8,
@@ -139,6 +147,7 @@ impl Renderer {
                     label: Some("Renderer Device"),
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
             )
@@ -196,7 +205,10 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        let mut renderer = Self {
+        let preview_readback = preview::PreviewReadbackResources::new(&device)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        let renderer = Self {
             device,
             queue,
             surface,
@@ -209,11 +221,21 @@ impl Renderer {
             uniform_bind_group_layout,
             vertex_buffer,
             index_buffer,
+            preview_readback,
         };
 
         // We'll initialize pipelines later when surface is configured
 
         Ok(renderer)
+    }
+
+    pub fn render_preview_to_cpu_with_pump(
+        &mut self,
+        input: &PreviewFrameInput<'_>,
+        pump: impl FnMut(&'static str),
+    ) -> Result<CpuFrame, RendererError> {
+        self.preview_readback
+            .render_to_cpu(&self.device, &self.queue, input, pump)
     }
 
     pub fn configure_surface(
@@ -370,6 +392,7 @@ impl Renderer {
                     alpha_to_coverage_enabled: false,
                 },
                 multiview: None,
+                cache: None,
             });
 
         Ok(render_pipeline)
@@ -660,6 +683,19 @@ impl Renderer {
         height: u32,
         render_fn: impl FnOnce(&mut wgpu::RenderPass),
     ) -> Result<Vec<u8>> {
+        self.render_to_cpu_with_pump(width, height, render_fn, || {
+            self.device.poll(wgpu::Maintain::Poll);
+        })
+        .await
+    }
+
+    pub async fn render_to_cpu_with_pump(
+        &self,
+        width: u32,
+        height: u32,
+        render_fn: impl FnOnce(&mut wgpu::RenderPass),
+        mut pump: impl FnMut(),
+    ) -> Result<Vec<u8>> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Target"),
             size: wgpu::Extent3d {
@@ -737,13 +773,25 @@ impl Renderer {
         let buffer_slice = buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
+            let _ = tx.send(result);
         });
 
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .unwrap()
-            .map_err(|_| anyhow::anyhow!("Buffer async error"))?;
+        use std::sync::mpsc::TryRecvError;
+        use std::time::Duration;
+
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(())) => break,
+                Ok(Err(_)) => return Err(anyhow::anyhow!("Buffer async error")),
+                Err(TryRecvError::Empty) => {
+                    pump();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return Err(anyhow::anyhow!("Readback channel disconnected"))
+                }
+            }
+        }
 
         let data = buffer_slice.get_mapped_range().to_vec();
         buffer.unmap();

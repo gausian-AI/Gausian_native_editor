@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::TextureHandle;
 use eframe::egui_wgpu;
@@ -12,10 +12,19 @@ use native_decoder::{
     self, create_decoder, is_native_decoding_available, DecoderConfig, NativeVideoDecoder,
     VideoFrame, YuvPixFmt as NativeYuvPixFmt,
 };
+use renderer::{
+    ColorSpace as RendererColorSpace, PixelFormat as RendererPixelFormat, PreviewDownscale,
+    PreviewFrameInput, PreviewReadbackResources, PreviewTextureSource,
+};
 
+use crate::decode::PlayState;
+use crate::gpu::context::GpuContext;
+use crate::gpu::readback::{ReadbackManager, ReadbackRequest, ReadbackResult, ReadbackTag};
+use crate::gpu::sync::{GpuSyncController, PlaybackPhase};
 use crate::preview::visual_source_at;
 use crate::VisualSource;
 use crate::PRESENT_SIZE_MISMATCH_LOGGED;
+use tracing::{debug, error, info, trace, warn};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PreviewShaderMode {
@@ -50,6 +59,195 @@ pub(crate) struct StreamMetadata {
     pub(crate) height: u32,
     pub(crate) fmt: YuvPixFmt,
     pub(crate) clear_color: egui::Color32,
+}
+
+struct ScheduledReadback {
+    tag: ReadbackTag,
+    auto: bool,
+}
+
+struct ReadbackSource {
+    rgba_texture: Arc<wgpu::Texture>,
+    y_plane: Option<Arc<wgpu::Texture>>,
+    uv_plane: Option<Arc<wgpu::Texture>>,
+    format: Option<YuvPixFmt>,
+    width: u32,
+    height: u32,
+}
+
+pub(crate) struct InteractivePolicy {
+    clip_id: Option<String>,
+    tier: Option<String>,
+    playback_started_at: Option<Instant>,
+    interactive_active: bool,
+    first_frame_ms: Option<u64>,
+    last_forced_wait: Option<Instant>,
+    last_lag: Option<Instant>,
+    hold_logged: bool,
+    last_play_state: Option<PlayState>,
+}
+
+impl InteractivePolicy {
+    fn new() -> Self {
+        Self {
+            clip_id: None,
+            tier: None,
+            playback_started_at: None,
+            interactive_active: true,
+            first_frame_ms: None,
+            last_forced_wait: None,
+            last_lag: None,
+            hold_logged: false,
+            last_play_state: None,
+        }
+    }
+
+    fn reset_for_clip(&mut self, clip_id: &str, tier: &str) {
+        self.clip_id = Some(clip_id.to_string());
+        self.tier = Some(tier.to_string());
+        self.playback_started_at = None;
+        self.interactive_active = true;
+        self.first_frame_ms = None;
+        self.last_forced_wait = None;
+        self.last_lag = None;
+        self.hold_logged = false;
+        self.last_play_state = None;
+    }
+
+    pub(crate) fn note_first_frame_ms(&mut self, value: Option<u64>) {
+        if let Some(ms) = value {
+            if self.first_frame_ms.is_none() {
+                self.first_frame_ms = Some(ms);
+            }
+        }
+    }
+
+    pub(crate) fn note_forced_wait(&mut self, now: Instant) {
+        self.last_forced_wait = Some(now);
+        if matches!(self.last_play_state, Some(PlayState::Playing)) {
+            self.playback_started_at = Some(now);
+            self.hold_logged = false;
+        }
+    }
+
+    pub(crate) fn note_lag(&mut self, lagging: bool, play_state: PlayState, now: Instant) {
+        if lagging && matches!(play_state, PlayState::Playing) {
+            self.last_lag = Some(now);
+            self.playback_started_at = Some(now);
+            self.hold_logged = false;
+        }
+    }
+
+    pub(crate) fn evaluate(
+        &mut self,
+        clip_id: &str,
+        tier: &str,
+        play_state: PlayState,
+        now: Instant,
+    ) -> bool {
+        if self.clip_id.as_deref() != Some(clip_id) || self.tier.as_deref() != Some(tier) {
+            self.reset_for_clip(clip_id, tier);
+        }
+
+        if !matches!(self.last_play_state, Some(PlayState::Playing))
+            && matches!(play_state, PlayState::Playing)
+        {
+            self.playback_started_at = Some(now);
+            self.last_forced_wait = None;
+            self.last_lag = None;
+            self.hold_logged = false;
+        }
+
+        if matches!(play_state, PlayState::Scrubbing | PlayState::Seeking) {
+            self.playback_started_at = Some(now);
+            self.interactive_active = true;
+            self.hold_logged = false;
+            self.last_play_state = Some(play_state);
+            return true;
+        }
+
+        if matches!(play_state, PlayState::Paused) {
+            if self.interactive_active {
+                info!(
+                    "[interactive] upscale clip={} mode=fullres trigger=paused",
+                    clip_id
+                );
+            }
+            self.interactive_active = false;
+            self.hold_logged = false;
+            self.playback_started_at = None;
+            self.last_play_state = Some(play_state);
+            return false;
+        }
+
+        // Remaining cases are Playing (or fallback default)
+        if tier != "original" {
+            if self.interactive_active {
+                info!(
+                    "[interactive] upscale clip={} mode=fullres trigger=proxy",
+                    clip_id
+                );
+            }
+            self.interactive_active = false;
+            self.hold_logged = false;
+            self.last_play_state = Some(play_state);
+            return false;
+        }
+
+        if matches!(play_state, PlayState::Playing) && self.playback_started_at.is_none() {
+            self.playback_started_at = Some(now);
+        }
+
+        let mut desired = self.interactive_active;
+        let mut trigger: Option<&'static str> = None;
+
+        if self.interactive_active {
+            if let Some(start) = self.playback_started_at {
+                let window = Duration::from_millis(750);
+                let first_ok = self.first_frame_ms.map(|ms| ms <= 33).unwrap_or(false);
+                let waited_enough = now.duration_since(start) >= window;
+                let lag_clear = self
+                    .last_lag
+                    .map(|t| now.duration_since(t) >= window)
+                    .unwrap_or(true);
+                let wait_clear = self
+                    .last_forced_wait
+                    .map(|t| now.duration_since(t) >= window)
+                    .unwrap_or(true);
+                if first_ok && waited_enough && lag_clear && wait_clear {
+                    desired = false;
+                    trigger = Some("realtime");
+                }
+            }
+        }
+
+        if desired != self.interactive_active {
+            if let Some(reason) = trigger {
+                info!(
+                    "[interactive] upscale clip={} mode=fullres trigger={}",
+                    clip_id, reason
+                );
+            }
+            self.interactive_active = desired;
+            if !desired {
+                self.hold_logged = false;
+                self.last_forced_wait = None;
+                self.last_lag = None;
+            }
+        } else if self.interactive_active
+            && !matches!(play_state, PlayState::Playing)
+            && !self.hold_logged
+        {
+            info!(
+                "[interactive] hold_lowres clip={} reason=no_realtime_or_proxy tier={}",
+                clip_id, tier
+            );
+            self.hold_logged = true;
+        }
+
+        self.last_play_state = Some(play_state);
+        self.interactive_active
+    }
 }
 
 pub(crate) struct PreviewState {
@@ -97,11 +295,63 @@ pub(crate) struct PreviewState {
     pub(crate) last_zc_tick: u64,
     #[cfg(target_os = "macos")]
     pub(crate) zc_logged: bool,
+    readback_backend: Box<dyn PreviewReadback + Send>,
+    readback_pending: VecDeque<ScheduledReadback>,
+    readback_results: VecDeque<ReadbackResult>,
+    readback_inflight: HashMap<ReadbackTag, Instant>,
+    readback_last_submit: HashMap<ReadbackTag, Instant>,
+    readback_ring: usize,
+    readback_scale: f32,
+    readback_auto_interval: Option<Duration>,
+    readback_last_auto: Option<Instant>,
+    readback_last_scrub: Option<Instant>,
+    readback_fallback_reason: Option<String>,
+    renderer_realtime_min_interval: Duration,
+    gpu_sync: Option<Arc<GpuSyncController>>,
+    gpu_phase: Option<PlaybackPhase>,
+    pub(crate) interactive_policy: InteractivePolicy,
+    pub(crate) last_logged_playback: Option<String>,
+    pub(crate) last_interactive_request: Option<bool>,
+    pub(crate) last_play_state_for_readback: Option<PlayState>,
 }
 
 impl PreviewState {
     pub(crate) fn new() -> Self {
-        Self {
+        let settings = PreviewReadbackSettings::from_env();
+        if renderer_backend_default_enabled() {
+            Self::new_with_renderer(RendererBackendOptions::from_env(settings))
+        } else {
+            Self::new_without_renderer_with_settings(settings)
+        }
+    }
+
+    pub(crate) fn new_with_renderer(options: RendererBackendOptions) -> Self {
+        let settings = options.settings;
+        Self::with_backend(
+            Box::new(RendererReadbackBackend::new(options)),
+            settings,
+            options.realtime_min_interval,
+        )
+    }
+
+    pub(crate) fn new_without_renderer() -> Self {
+        let settings = PreviewReadbackSettings::from_env();
+        Self::new_without_renderer_with_settings(settings)
+    }
+
+    fn new_without_renderer_with_settings(settings: PreviewReadbackSettings) -> Self {
+        let backend = Box::new(ReadbackManagerBackend::new(settings.ring));
+        Self::with_backend(backend, settings, Duration::from_millis(0))
+    }
+
+    fn with_backend(
+        backend: Box<dyn PreviewReadback + Send>,
+        settings: PreviewReadbackSettings,
+        renderer_realtime_min_interval: Duration,
+    ) -> Self {
+        let backend_name = backend.name();
+
+        let state = Self {
             texture: None,
             stream: None,
             last_pts: None,
@@ -141,12 +391,82 @@ impl PreviewState {
             last_zc_tick: 0,
             #[cfg(target_os = "macos")]
             zc_logged: false,
+            readback_backend: backend,
+            readback_pending: VecDeque::new(),
+            readback_results: VecDeque::new(),
+            readback_inflight: HashMap::new(),
+            readback_last_submit: HashMap::new(),
+            readback_ring: settings.ring,
+            readback_scale: settings.scale,
+            readback_auto_interval: settings.auto_interval,
+            readback_last_auto: None,
+            readback_last_scrub: None,
+            readback_fallback_reason: None,
+            renderer_realtime_min_interval,
+            gpu_sync: None,
+            gpu_phase: None,
+            interactive_policy: InteractivePolicy::new(),
+            last_logged_playback: None,
+            last_interactive_request: None,
+            last_play_state_for_readback: None,
+        };
+
+        info!(
+            target = "preview_readback",
+            backend = backend_name,
+            scale = settings.scale,
+            ring = settings.ring,
+            "preview readback backend initialized"
+        );
+
+        state
+    }
+
+    pub(crate) fn update_gpu_phase(
+        &mut self,
+        rs: &eframe::egui_wgpu::RenderState,
+        phase: PlaybackPhase,
+    ) {
+        let controller = match self.gpu_sync.as_ref() {
+            Some(existing) => existing.clone(),
+            None => {
+                let ctrl = Arc::new(GpuSyncController::new(rs.device.clone(), phase));
+                self.gpu_sync = Some(ctrl.clone());
+                ctrl
+            }
+        };
+        controller.set_phase(phase);
+
+        if self.gpu_phase != Some(phase) {
+            if matches!(phase, PlaybackPhase::PlayingRealtime) {
+                self.readback_backend.clear_for_realtime();
+                self.readback_pending.clear();
+                self.readback_inflight.clear();
+                self.readback_results.clear();
+                self.readback_last_auto = None;
+                self.readback_last_scrub = None;
+            }
+            self.gpu_phase = Some(phase);
         }
+    }
+
+    pub(crate) fn gpu_context<'a>(
+        &self,
+        rs: &'a eframe::egui_wgpu::RenderState,
+    ) -> Option<GpuContext<'a>> {
+        self.gpu_sync
+            .as_ref()
+            .cloned()
+            .map(|sync| GpuContext::new(rs, sync))
+    }
+
+    pub(crate) fn gpu_sync_controller(&self) -> Option<Arc<GpuSyncController>> {
+        self.gpu_sync.as_ref().cloned()
     }
 
     pub(crate) fn ensure_stream_slot<'a>(
         &'a mut self,
-        device: &eframe::wgpu::Device,
+        gpu: &GpuContext<'_>,
         renderer: &mut eframe::egui_wgpu::Renderer,
         meta: StreamMetadata,
     ) -> &'a mut StreamSlot {
@@ -193,57 +513,64 @@ impl PreviewState {
             ),
         };
 
-        let y_tex = Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor {
-            label: Some("preview_stream_y"),
-            size: eframe::wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: eframe::wgpu::TextureDimension::D2,
-            format: y_format,
-            usage: eframe::wgpu::TextureUsages::COPY_DST
-                | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }));
+        let (y_tex, uv_tex, out_tex, out_view, tex_id) = gpu.with_device(|device| {
+            let y_tex = Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor {
+                label: Some("preview_stream_y"),
+                size: eframe::wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: eframe::wgpu::TextureDimension::D2,
+                format: y_format,
+                usage: eframe::wgpu::TextureUsages::COPY_DST
+                    | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }));
 
-        let uv_tex = Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor {
-            label: Some("preview_stream_uv"),
-            size: eframe::wgpu::Extent3d {
-                width: (width + 1) / 2,
-                height: (height + 1) / 2,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: eframe::wgpu::TextureDimension::D2,
-            format: uv_format,
-            usage: eframe::wgpu::TextureUsages::COPY_DST
-                | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }));
+            let uv_tex = Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor {
+                label: Some("preview_stream_uv"),
+                size: eframe::wgpu::Extent3d {
+                    width: (width + 1) / 2,
+                    height: (height + 1) / 2,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: eframe::wgpu::TextureDimension::D2,
+                format: uv_format,
+                usage: eframe::wgpu::TextureUsages::COPY_DST
+                    | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }));
 
-        let out_tex = Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor {
-            label: Some("preview_stream_out"),
-            size: eframe::wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: eframe::wgpu::TextureDimension::D2,
-            format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: eframe::wgpu::TextureUsages::COPY_DST
-                | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }));
+            let out_tex = Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor {
+                label: Some("preview_stream_out"),
+                size: eframe::wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: eframe::wgpu::TextureDimension::D2,
+                format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: eframe::wgpu::TextureUsages::COPY_DST
+                    | eframe::wgpu::TextureUsages::TEXTURE_BINDING
+                    | eframe::wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            }));
 
-        let out_view = out_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
-        let tex_id =
-            renderer.register_native_texture(device, &out_view, eframe::wgpu::FilterMode::Linear);
+            let out_view = out_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+            let tex_id = renderer.register_native_texture(
+                device,
+                &out_view,
+                eframe::wgpu::FilterMode::Linear,
+            );
+            (y_tex, uv_tex, out_tex, out_view, tex_id)
+        });
 
         self.stream = Some(StreamSlot {
             stream_id,
@@ -264,7 +591,7 @@ impl PreviewState {
     // Ensure triple-buffer NV12 plane textures at native size
     pub(crate) fn ensure_yuv_textures(
         &mut self,
-        rs: &eframe::egui_wgpu::RenderState,
+        gpu: &GpuContext<'_>,
         w: u32,
         h: u32,
         fmt: YuvPixFmt,
@@ -278,8 +605,7 @@ impl PreviewState {
         {
             return;
         }
-        let device = &*rs.device;
-        let supports16 = device_supports_16bit_norm(rs);
+        let supports16 = device_supports_16bit_norm(gpu);
         let (y_format, uv_format) = match fmt {
             YuvPixFmt::Nv12 => (
                 eframe::wgpu::TextureFormat::R8Unorm,
@@ -299,7 +625,8 @@ impl PreviewState {
                 }
             }
         };
-        let make_y = || {
+
+        let create_y = |device: &eframe::wgpu::Device| {
             device.create_texture(&eframe::wgpu::TextureDescriptor {
                 label: Some("preview_nv12_y"),
                 size: eframe::wgpu::Extent3d {
@@ -316,7 +643,7 @@ impl PreviewState {
                 view_formats: &[],
             })
         };
-        let make_uv = || {
+        let create_uv = |device: &eframe::wgpu::Device| {
             device.create_texture(&eframe::wgpu::TextureDescriptor {
                 label: Some("preview_nv12_uv"),
                 size: eframe::wgpu::Extent3d {
@@ -334,10 +661,13 @@ impl PreviewState {
             })
         };
 
-        for i in 0..3 {
-            self.y_tex[i] = Some(std::sync::Arc::new(make_y()));
-            self.uv_tex[i] = Some(std::sync::Arc::new(make_uv()));
-        }
+        gpu.with_device(|device| {
+            for i in 0..3 {
+                self.y_tex[i] = Some(std::sync::Arc::new(create_y(device)));
+                self.uv_tex[i] = Some(std::sync::Arc::new(create_uv(device)));
+            }
+        });
+
         self.ring_write = 0;
         self.ring_present = 0;
         self.y_size = y_sz;
@@ -346,15 +676,14 @@ impl PreviewState {
 
     pub(crate) fn upload_yuv_planes(
         &mut self,
-        rs: &eframe::egui_wgpu::RenderState,
+        gpu: &GpuContext<'_>,
         fmt: YuvPixFmt,
         y: &[u8],
         uv: &[u8],
         w: u32,
         h: u32,
     ) {
-        self.ensure_yuv_textures(rs, w, h, fmt);
-        let queue = &*rs.queue;
+        self.ensure_yuv_textures(gpu, w, h, fmt);
         let next_idx = (self.ring_write + 1) % 3;
         if next_idx == self.ring_present {
             eprintln!(
@@ -373,20 +702,24 @@ impl PreviewState {
             YuvPixFmt::Nv12 => (1usize, 2usize),
             YuvPixFmt::P010 => (2usize, 4usize),
         };
-        upload_plane(queue, y_tex, y, w, h, (w as usize) * y_bpp, y_bpp);
-        upload_plane(
-            queue,
-            uv_tex,
-            uv,
-            uv_w,
-            uv_h,
-            (uv_w as usize) * uv_bpp_per_texel,
-            uv_bpp_per_texel,
-        );
+
+        gpu.with_queue(|queue| {
+            upload_plane(queue, y_tex, y, w, h, (w as usize) * y_bpp, y_bpp);
+            upload_plane(
+                queue,
+                uv_tex,
+                uv,
+                uv_w,
+                uv_h,
+                (uv_w as usize) * uv_bpp_per_texel,
+                uv_bpp_per_texel,
+            );
+        });
 
         self.ring_present = idx;
         self.ring_write = next_idx;
         self.last_fmt = Some(fmt);
+        crate::gpu_pump!(gpu, "upload_yuv_planes");
     }
 
     pub(crate) fn current_plane_textures(
@@ -421,12 +754,7 @@ impl PreviewState {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn ensure_zero_copy_nv12_textures(
-        &mut self,
-        rs: &eframe::egui_wgpu::RenderState,
-        w: u32,
-        h: u32,
-    ) {
+    pub(crate) fn ensure_zero_copy_nv12_textures(&mut self, gpu: &GpuContext<'_>, w: u32, h: u32) {
         let target_y = (w, h);
         let target_uv = ((w + 1) / 2, (h + 1) / 2);
         let needs_new = match &self.gpu_yuv {
@@ -437,35 +765,38 @@ impl PreviewState {
             return;
         }
 
-        let device = &*rs.device;
-        let make_tex = |label: &str, size: (u32, u32), format: eframe::wgpu::TextureFormat| {
-            Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor {
-                label: Some(label),
-                size: eframe::wgpu::Extent3d {
-                    width: size.0,
-                    height: size.1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: eframe::wgpu::TextureDimension::D2,
-                format,
-                usage: eframe::wgpu::TextureUsages::COPY_DST
-                    | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            }))
-        };
+        let (y_tex, uv_tex) = gpu.with_device(|device| {
+            let make_tex = |label: &str, size: (u32, u32), format: eframe::wgpu::TextureFormat| {
+                Arc::new(device.create_texture(&eframe::wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: eframe::wgpu::Extent3d {
+                        width: size.0,
+                        height: size.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: eframe::wgpu::TextureDimension::D2,
+                    format,
+                    usage: eframe::wgpu::TextureUsages::COPY_DST
+                        | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                }))
+            };
 
-        let y_tex = make_tex(
-            "preview_zc_nv12_y",
-            target_y,
-            eframe::wgpu::TextureFormat::R8Unorm,
-        );
-        let uv_tex = make_tex(
-            "preview_zc_nv12_uv",
-            target_uv,
-            eframe::wgpu::TextureFormat::Rg8Unorm,
-        );
+            let y_tex = make_tex(
+                "preview_zc_nv12_y",
+                target_y,
+                eframe::wgpu::TextureFormat::R8Unorm,
+            );
+            let uv_tex = make_tex(
+                "preview_zc_nv12_uv",
+                target_uv,
+                eframe::wgpu::TextureFormat::Rg8Unorm,
+            );
+            (y_tex, uv_tex)
+        });
+
         self.gpu_yuv = Some(native_decoder::GpuYuv {
             y_tex: y_tex.clone(),
             uv_tex: uv_tex.clone(),
@@ -493,7 +824,7 @@ impl PreviewState {
 
     pub(crate) fn present_yuv(
         &mut self,
-        rs: &eframe::egui_wgpu::RenderState,
+        gpu: &GpuContext<'_>,
         path: &str,
         t_sec: f64,
     ) -> Option<(
@@ -524,7 +855,7 @@ impl PreviewState {
                 uv = frame.uv;
                 w = frame.width;
                 h = frame.height;
-                if fmt == YuvPixFmt::P010 && !device_supports_16bit_norm(rs) {
+                if fmt == YuvPixFmt::P010 && !device_supports_16bit_norm(gpu) {
                     if let Some((_f, ny, nuv, nw, nh)) = decode_video_frame_nv12_only(path, t_sec) {
                         fmt = YuvPixFmt::Nv12;
                         y = ny;
@@ -553,7 +884,7 @@ impl PreviewState {
                 return None;
             }
         }
-        self.upload_yuv_planes(rs, fmt, &y, &uv, w, h);
+        self.upload_yuv_planes(gpu, fmt, &y, &uv, w, h);
         let idx = self.ring_present;
         Some((
             fmt,
@@ -565,6 +896,7 @@ impl PreviewState {
     // Ensure double-buffered GPU textures and a registered TextureId
     pub(crate) fn ensure_gpu_textures(
         &mut self,
+        gpu: &GpuContext<'_>,
         rs: &eframe::egui_wgpu::RenderState,
         w: u32,
         h: u32,
@@ -575,43 +907,51 @@ impl PreviewState {
         {
             return;
         }
-        let device = &*rs.device;
-        let make_tex = || {
-            device.create_texture(&eframe::wgpu::TextureDescriptor {
-                label: Some("preview_native_tex"),
-                size: eframe::wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: eframe::wgpu::TextureDimension::D2,
-                format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: eframe::wgpu::TextureUsages::COPY_DST
-                    | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-        };
-        let tex_a = std::sync::Arc::new(make_tex());
-        let view_a = tex_a.create_view(&eframe::wgpu::TextureViewDescriptor::default());
-        let tex_b = std::sync::Arc::new(make_tex());
-        let view_b = tex_b.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+
+        let (tex_a, view_a, tex_b, view_b) = gpu.with_device(|device| {
+            let make_tex = || {
+                device.create_texture(&eframe::wgpu::TextureDescriptor {
+                    label: Some("preview_native_tex"),
+                    size: eframe::wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: eframe::wgpu::TextureDimension::D2,
+                    format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: eframe::wgpu::TextureUsages::COPY_DST
+                        | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            };
+            let tex_a = std::sync::Arc::new(make_tex());
+            let view_a = tex_a.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+            let tex_b = std::sync::Arc::new(make_tex());
+            let view_b = tex_b.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+            (tex_a, view_a, tex_b, view_b)
+        });
 
         // Register a TextureId if needed, otherwise update it to A initially
         let mut renderer = rs.renderer.write();
-        if let Some(id) = self.gpu_tex_id {
-            renderer.update_egui_texture_from_wgpu_texture(
-                device,
-                &view_a,
-                eframe::wgpu::FilterMode::Linear,
-                id,
-            );
-        } else {
-            let id =
-                renderer.register_native_texture(device, &view_a, eframe::wgpu::FilterMode::Linear);
-            self.gpu_tex_id = Some(id);
-        }
+        gpu.with_device(|device| {
+            if let Some(id) = self.gpu_tex_id {
+                renderer.update_egui_texture_from_wgpu_texture(
+                    device,
+                    &view_a,
+                    eframe::wgpu::FilterMode::Linear,
+                    id,
+                );
+            } else {
+                let id = renderer.register_native_texture(
+                    device,
+                    &view_a,
+                    eframe::wgpu::FilterMode::Linear,
+                );
+                self.gpu_tex_id = Some(id);
+            }
+        });
 
         self.gpu_tex_a = Some(tex_a);
         self.gpu_view_a = Some(view_a);
@@ -622,9 +962,13 @@ impl PreviewState {
     }
 
     // Upload RGBA bytes into the next back buffer and retarget the TextureId to it
-    pub(crate) fn upload_gpu_frame(&mut self, rs: &eframe::egui_wgpu::RenderState, rgba: &[u8]) {
+    pub(crate) fn upload_gpu_frame(
+        &mut self,
+        gpu: &GpuContext<'_>,
+        rs: &eframe::egui_wgpu::RenderState,
+        rgba: &[u8],
+    ) {
         let (w, h) = self.gpu_size;
-        let queue = &*rs.queue;
         // swap buffer
         self.gpu_use_b = !self.gpu_use_b;
         let (tex, view) = if self.gpu_use_b {
@@ -642,77 +986,82 @@ impl PreviewState {
             let bytes_per_row = (w * 4) as usize;
             let align = eframe::wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize; // 256
             let padded_bpr = ((bytes_per_row + align - 1) / align) * align;
-            if padded_bpr == bytes_per_row {
-                queue.write_texture(
-                    eframe::wgpu::ImageCopyTexture {
-                        texture: tex,
-                        mip_level: 0,
-                        origin: eframe::wgpu::Origin3d::ZERO,
-                        aspect: eframe::wgpu::TextureAspect::All,
-                    },
-                    rgba,
-                    eframe::wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some((bytes_per_row) as u32),
-                        rows_per_image: Some(h),
-                    },
-                    eframe::wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            } else {
-                // build a padded buffer per row to satisfy alignment
-                let mut padded = vec![0u8; padded_bpr * (h as usize)];
-                for row in 0..(h as usize) {
-                    let src_off = row * bytes_per_row;
-                    let dst_off = row * padded_bpr;
-                    padded[dst_off..dst_off + bytes_per_row]
-                        .copy_from_slice(&rgba[src_off..src_off + bytes_per_row]);
+            gpu.with_queue(|queue| {
+                if padded_bpr == bytes_per_row {
+                    queue.write_texture(
+                        eframe::wgpu::ImageCopyTexture {
+                            texture: tex,
+                            mip_level: 0,
+                            origin: eframe::wgpu::Origin3d::ZERO,
+                            aspect: eframe::wgpu::TextureAspect::All,
+                        },
+                        rgba,
+                        eframe::wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bytes_per_row as u32),
+                            rows_per_image: Some(h),
+                        },
+                        eframe::wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                } else {
+                    // build a padded buffer per row to satisfy alignment
+                    let mut padded = vec![0u8; padded_bpr * (h as usize)];
+                    for row in 0..(h as usize) {
+                        let src_off = row * bytes_per_row;
+                        let dst_off = row * padded_bpr;
+                        padded[dst_off..dst_off + bytes_per_row]
+                            .copy_from_slice(&rgba[src_off..src_off + bytes_per_row]);
+                    }
+                    queue.write_texture(
+                        eframe::wgpu::ImageCopyTexture {
+                            texture: tex,
+                            mip_level: 0,
+                            origin: eframe::wgpu::Origin3d::ZERO,
+                            aspect: eframe::wgpu::TextureAspect::All,
+                        },
+                        &padded,
+                        eframe::wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(padded_bpr as u32),
+                            rows_per_image: Some(h),
+                        },
+                        eframe::wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
                 }
-                queue.write_texture(
-                    eframe::wgpu::ImageCopyTexture {
-                        texture: tex,
-                        mip_level: 0,
-                        origin: eframe::wgpu::Origin3d::ZERO,
-                        aspect: eframe::wgpu::TextureAspect::All,
-                    },
-                    &padded,
-                    eframe::wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(padded_bpr as u32),
-                        rows_per_image: Some(h),
-                    },
-                    eframe::wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
+            });
             if let Some(id) = self.gpu_tex_id {
-                let device = &*rs.device;
                 let mut renderer = rs.renderer.write();
-                renderer.update_egui_texture_from_wgpu_texture(
-                    device,
-                    view,
-                    eframe::wgpu::FilterMode::Linear,
-                    id,
-                );
+                gpu.with_device(|device| {
+                    renderer.update_egui_texture_from_wgpu_texture(
+                        device,
+                        view,
+                        eframe::wgpu::FilterMode::Linear,
+                        id,
+                    );
+                });
             }
+            crate::gpu_pump!(gpu, "upload_gpu_frame");
         }
     }
 
     // Present a GPU-cached frame for a source/time. If absent, decode one and upload.
     pub(crate) fn present_gpu_cached(
         &mut self,
+        gpu: &GpuContext<'_>,
         rs: &eframe::egui_wgpu::RenderState,
         path: &str,
         t_sec: f64,
         desired: (u32, u32),
     ) -> Option<egui::TextureId> {
-        self.ensure_gpu_textures(rs, desired.0, desired.1);
+        self.ensure_gpu_textures(gpu, rs, desired.0, desired.1);
         // Try cache first
         let key = FrameCacheKey::new(path, t_sec, desired.0, desired.1);
         if let Some(cached) = self.get_cached_frame(&key) {
@@ -720,7 +1069,7 @@ impl PreviewState {
             for p in &cached.image.pixels {
                 bytes.extend_from_slice(&p.to_array());
             }
-            self.upload_gpu_frame(rs, &bytes);
+            self.upload_gpu_frame(gpu, rs, &bytes);
             return self.gpu_tex_id; // ignored in wgpu path; retained for compatibility
         }
         // Decode one frame on demand
@@ -737,7 +1086,7 @@ impl PreviewState {
             for p in &img.pixels {
                 bytes.extend_from_slice(&p.to_array());
             }
-            self.upload_gpu_frame(rs, &bytes);
+            self.upload_gpu_frame(gpu, rs, &bytes);
             return self.gpu_tex_id; // ignored in wgpu path; retained for compatibility
         }
         None
@@ -967,7 +1316,7 @@ impl PreviewState {
 
     pub(crate) fn present_yuv_with_frame(
         &mut self,
-        rs: &eframe::egui_wgpu::RenderState,
+        gpu: &GpuContext<'_>,
         path: &str,
         t_sec: f64,
         vf_opt: Option<&native_decoder::VideoFrame>,
@@ -986,7 +1335,7 @@ impl PreviewState {
             let mut uv: Vec<u8> = vf.uv_plane.clone();
             let w = vf.width;
             let h = vf.height;
-            if fmt == YuvPixFmt::P010 && !device_supports_16bit_norm(rs) {
+            if fmt == YuvPixFmt::P010 && !device_supports_16bit_norm(gpu) {
                 if let Some((_f, ny, nuv, nw, nh)) = decode_video_frame_nv12_only(path, t_sec) {
                     fmt = YuvPixFmt::Nv12;
                     y = ny;
@@ -1011,7 +1360,7 @@ impl PreviewState {
                     self.nv12_cache.remove(&old);
                 }
             }
-            self.upload_yuv_planes(rs, fmt, &y, &uv, w, h);
+            self.upload_yuv_planes(gpu, fmt, &y, &uv, w, h);
             let idx = self.ring_present;
             return Some((
                 fmt,
@@ -1020,12 +1369,12 @@ impl PreviewState {
             ));
         }
         // Fallback to old path
-        self.present_yuv(rs, path, t_sec)
+        self.present_yuv(gpu, path, t_sec)
     }
 
     pub(crate) fn present_yuv_from_bytes(
         &mut self,
-        rs: &eframe::egui_wgpu::RenderState,
+        gpu: &GpuContext<'_>,
         fmt: YuvPixFmt,
         y_bytes: &[u8],
         uv_bytes: &[u8],
@@ -1037,7 +1386,7 @@ impl PreviewState {
         Arc<eframe::wgpu::Texture>,
     )> {
         // Ensure textures/buffers exist at this decoded size/format
-        self.ensure_yuv_textures(rs, w, h, fmt);
+        self.ensure_yuv_textures(gpu, w, h, fmt);
 
         // Write into current ring slot
         let wi = self.ring_write % 3;
@@ -1070,23 +1419,24 @@ impl PreviewState {
             return None;
         }
 
-        let queue = &*rs.queue;
+        gpu.with_queue(|queue| {
+            if let Some(y_tex) = self.y_tex[wi].as_ref() {
+                upload_plane(queue, &**y_tex, y_bytes, w, h, y_w * y_bpp, y_bpp);
+            }
 
-        if let Some(y_tex) = self.y_tex[wi].as_ref() {
-            upload_plane(queue, &**y_tex, y_bytes, w, h, y_w * y_bpp, y_bpp);
-        }
-
-        if let Some(uv_tex) = self.uv_tex[wi].as_ref() {
-            upload_plane(
-                queue,
-                &**uv_tex,
-                uv_bytes,
-                (w + 1) / 2,
-                (h + 1) / 2,
-                uv_w * uv_bpp_per_texel,
-                uv_bpp_per_texel,
-            );
-        }
+            if let Some(uv_tex) = self.uv_tex[wi].as_ref() {
+                upload_plane(
+                    queue,
+                    &**uv_tex,
+                    uv_bytes,
+                    (w + 1) / 2,
+                    (h + 1) / 2,
+                    uv_w * uv_bpp_per_texel,
+                    uv_bpp_per_texel,
+                );
+            }
+        });
+        crate::gpu_pump!(gpu, "present_yuv_from_bytes");
 
         // Persist last-good so fallback can reuse
         self.last_fmt = Some(fmt);
@@ -1105,26 +1455,26 @@ impl PreviewState {
     #[cfg(target_os = "macos")]
     pub(crate) fn present_nv12_zero_copy(
         &mut self,
-        rs: &eframe::egui_wgpu::RenderState,
+        gpu: &GpuContext<'_>,
         zc: &native_decoder::IOSurfaceFrame,
     ) -> Option<(
         YuvPixFmt,
         Arc<eframe::wgpu::Texture>,
         Arc<eframe::wgpu::Texture>,
     )> {
-        self.ensure_zero_copy_nv12_textures(rs, zc.width, zc.height);
+        self.ensure_zero_copy_nv12_textures(gpu, zc.width, zc.height);
         if let Some((y_arc, uv_arc)) = self
             .gpu_yuv
             .as_ref()
             .map(|g| (g.y_tex.clone(), g.uv_tex.clone()))
         {
-            let queue = &*rs.queue;
-            if let Err(e) = self
-                .gpu_yuv
-                .as_ref()
-                .unwrap()
-                .import_from_iosurface(queue, zc)
-            {
+            let import_result = gpu.with_queue(|queue| {
+                self.gpu_yuv
+                    .as_ref()
+                    .unwrap()
+                    .import_from_iosurface(queue, zc)
+            });
+            if let Err(e) = import_result {
                 eprintln!("[zc] import_from_iosurface error: {}", e);
                 return None;
             }
@@ -1147,9 +1497,264 @@ impl PreviewState {
                 zc.width,
                 zc.height,
             );
+            crate::gpu_pump!(gpu, "present_nv12_zero_copy");
             return Some((YuvPixFmt::Nv12, y_arc, uv_arc));
         }
         None
+    }
+
+    pub(crate) fn request_scrub_readback(&mut self) {
+        self.enqueue_readback(ReadbackTag::Scrub, false);
+    }
+
+    pub(crate) fn request_capture_readback(&mut self) {
+        self.enqueue_readback(ReadbackTag::Capture, false);
+    }
+
+    pub(crate) fn process_readback(&mut self, gpu: &GpuContext<'_>, play_state: PlayState) {
+        if let Some(interval) = self.readback_auto_interval {
+            if matches!(play_state, PlayState::Scrubbing | PlayState::Seeking) {
+                let should_emit = self
+                    .readback_last_auto
+                    .map(|last| last.elapsed() >= interval)
+                    .unwrap_or(true);
+                if should_emit {
+                    self.enqueue_readback(ReadbackTag::Scrub, true);
+                }
+            }
+        }
+
+        let Some(controller) = self.gpu_sync_controller() else {
+            return;
+        };
+        let phase = controller.phase();
+
+        let backend_has_pending = self.readback_backend.has_pending();
+        let has_work = backend_has_pending || !self.readback_pending.is_empty();
+        if !has_work {
+            return;
+        }
+
+        let poll = self.readback_backend.poll(controller.as_ref(), phase);
+        if poll.forced_wait {
+            self.interactive_policy.note_forced_wait(Instant::now());
+        }
+
+        while let Some(result) = self.readback_backend.try_recv() {
+            self.readback_inflight.remove(&result.tag);
+            self.readback_last_submit
+                .insert(result.tag.clone(), Instant::now());
+            self.push_readback_result(result);
+        }
+
+        let Some(source) = self.build_readback_source() else {
+            return;
+        };
+
+        let mut deferred: Vec<ScheduledReadback> = Vec::new();
+
+        while let Some(job) = self.readback_pending.pop_front() {
+            if self.should_defer_request(&job, phase) {
+                deferred.push(job);
+                continue;
+            }
+
+            let (target_width, target_height) =
+                self.calculate_target_dimensions(source.width.max(1), source.height.max(1));
+            let bytes_per_row = align_bytes_per_row(target_width);
+            let allow_blocking = !phase.is_realtime_playing();
+
+            let request = PreviewReadbackRequest {
+                tag: &job.tag,
+                auto: job.auto,
+                phase,
+                source: &source,
+                original_width: source.width.max(1),
+                original_height: source.height.max(1),
+                target_width,
+                target_height,
+                bytes_per_row,
+                allow_blocking,
+            };
+
+            match self.readback_backend.readback(gpu, &request) {
+                Ok(ReadbackSubmission::Completed(result)) => {
+                    self.readback_last_submit
+                        .insert(job.tag.clone(), Instant::now());
+                    self.note_readback_success(&job);
+                    self.readback_inflight.remove(&job.tag);
+                    self.push_readback_result(result);
+                }
+                Ok(ReadbackSubmission::Submitted) => {
+                    self.record_inflight(&job);
+                    self.note_readback_success(&job);
+                }
+                Ok(ReadbackSubmission::Pending) => {
+                    if phase.is_realtime_playing()
+                        && matches!(self.readback_backend.kind(), PreviewReadbackKind::Legacy)
+                    {
+                        // Legacy manager cannot service realtime requests without blocking; drop request.
+                    } else {
+                        deferred.push(job);
+                    }
+                }
+                Err(err) => {
+                    self.handle_readback_error(err, &job);
+                    deferred.push(job);
+                }
+            }
+        }
+
+        if !deferred.is_empty() {
+            self.readback_pending.extend(deferred);
+        }
+    }
+
+    pub(crate) fn take_readback_results(&mut self) -> Vec<ReadbackResult> {
+        self.readback_results.drain(..).collect()
+    }
+
+    fn enqueue_readback(&mut self, tag: ReadbackTag, auto: bool) {
+        if self
+            .readback_pending
+            .iter()
+            .any(|pending| pending.tag == tag && pending.auto == auto)
+        {
+            return;
+        }
+
+        if let Some(start) = self.readback_inflight.get(&tag) {
+            if start.elapsed() < readback_inflight_timeout(&tag) {
+                return;
+            }
+            self.readback_inflight.remove(&tag);
+        }
+
+        if let Some(last) = self.readback_last_submit.get(&tag) {
+            let min_gap = readback_min_interval(&tag, auto);
+            if last.elapsed() < min_gap {
+                return;
+            }
+        }
+
+        self.readback_pending
+            .push_back(ScheduledReadback { tag, auto });
+    }
+
+    fn build_readback_source(&self) -> Option<ReadbackSource> {
+        let slot = self.stream.as_ref()?;
+        let width = slot.width;
+        let height = slot.height;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let rgba_texture = Arc::clone(slot.out_tex.as_ref()?);
+        Some(ReadbackSource {
+            rgba_texture,
+            y_plane: slot.y_tex.as_ref().map(Arc::clone),
+            uv_plane: slot.uv_tex.as_ref().map(Arc::clone),
+            format: Some(slot.fmt),
+            width,
+            height,
+        })
+    }
+
+    fn calculate_target_dimensions(&self, original_width: u32, original_height: u32) -> (u32, u32) {
+        let scale = self.readback_scale.clamp(0.1, 1.0);
+        if (scale - 1.0).abs() < f32::EPSILON {
+            (original_width, original_height)
+        } else {
+            (
+                (original_width as f32 * scale).round().max(1.0) as u32,
+                (original_height as f32 * scale).round().max(1.0) as u32,
+            )
+        }
+    }
+
+    fn should_defer_request(&self, job: &ScheduledReadback, phase: PlaybackPhase) -> bool {
+        if job.auto && matches!(job.tag, ReadbackTag::Scrub) {
+            if let Some(interval) = self.readback_auto_interval {
+                if let Some(last) = self.readback_last_scrub {
+                    if last.elapsed() < interval {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if phase.is_realtime_playing()
+            && matches!(self.readback_backend.kind(), PreviewReadbackKind::Renderer)
+            && !matches!(job.tag, ReadbackTag::Capture)
+        {
+            if self.renderer_realtime_min_interval > Duration::from_millis(0) {
+                if let Some(last) = self.readback_last_submit.get(&job.tag) {
+                    if last.elapsed() < self.renderer_realtime_min_interval {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    fn record_inflight(&mut self, job: &ScheduledReadback) {
+        let now = Instant::now();
+        self.readback_inflight.insert(job.tag.clone(), now);
+        self.readback_last_submit.insert(job.tag.clone(), now);
+    }
+
+    fn note_readback_success(&mut self, job: &ScheduledReadback) {
+        if matches!(job.tag, ReadbackTag::Scrub) {
+            let now = Instant::now();
+            self.readback_last_scrub = Some(now);
+            if job.auto {
+                self.readback_last_auto = Some(now);
+            }
+        }
+    }
+
+    fn push_readback_result(&mut self, result: ReadbackResult) {
+        if self.readback_results.len() >= self.readback_ring {
+            self.readback_results.pop_front();
+        }
+        self.readback_results.push_back(result);
+    }
+
+    fn handle_readback_error(&mut self, error: PreviewReadbackError, job: &ScheduledReadback) {
+        match error {
+            PreviewReadbackError::Unsupported { reason } => {
+                warn!(
+                    target = "preview_readback",
+                    tag = ?job.tag,
+                    reason,
+                    "preview readback unsupported; switching to legacy backend"
+                );
+                self.fallback_to_legacy(&reason);
+            }
+            PreviewReadbackError::SubmissionFailed { reason } => {
+                warn!(
+                    target = "preview_readback",
+                    tag = ?job.tag,
+                    reason,
+                    "preview readback submission failed"
+                );
+            }
+        }
+    }
+
+    fn fallback_to_legacy(&mut self, reason: &str) {
+        if matches!(self.readback_backend.kind(), PreviewReadbackKind::Legacy) {
+            return;
+        }
+        warn!(
+            target = "preview_readback",
+            reason, "falling back to legacy preview readback backend"
+        );
+        self.readback_backend = Box::new(ReadbackManagerBackend::new(self.readback_ring));
+        self.readback_backend.clear_for_realtime();
+        self.readback_inflight.clear();
+        self.readback_fallback_reason = Some(reason.to_string());
     }
 }
 
@@ -1178,6 +1783,241 @@ fn decode_to_color_image(bytes: &[u8]) -> Option<egui::ColorImage> {
         &data,
     ))
 }
+
+struct ReadbackDownscale {
+    pipeline: wgpu::RenderPipeline,
+    bind_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+struct ReadbackResolve {
+    texture: Arc<wgpu::Texture>,
+    width: u32,
+    height: u32,
+}
+
+impl ReadbackDownscale {
+    fn new(device: &wgpu::Device) -> Self {
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("readback-downscale-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("readback-downscale-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("readback-downscale-shader"),
+            source: wgpu::ShaderSource::Wgsl(READBACK_DOWNSCALE_SHADER.into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("readback-downscale-pipeline-layout"),
+            bind_group_layouts: &[&bind_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("readback-downscale-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Self {
+            pipeline,
+            bind_layout,
+            sampler,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreviewReadbackSettings {
+    ring: usize,
+    scale: f32,
+    auto_interval: Option<Duration>,
+}
+
+impl PreviewReadbackSettings {
+    fn from_env() -> Self {
+        Self {
+            ring: readback_env_ring(),
+            scale: readback_env_scale(),
+            auto_interval: readback_env_interval(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RendererBackendOptions {
+    pub(crate) settings: PreviewReadbackSettings,
+    pub(crate) realtime_min_interval: Duration,
+}
+
+impl RendererBackendOptions {
+    fn new(settings: PreviewReadbackSettings, realtime_min_interval: Duration) -> Self {
+        Self {
+            settings,
+            realtime_min_interval,
+        }
+    }
+
+    fn from_env(settings: PreviewReadbackSettings) -> Self {
+        let realtime_min_interval = std::env::var("GAUS_PREVIEW_RENDERER_REALTIME_FPS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .and_then(|fps| {
+                if fps > 0 {
+                    Some(Duration::from_millis((1000 / fps.max(1)) as u64))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(Duration::from_millis(100));
+        Self::new(settings, realtime_min_interval)
+    }
+}
+
+fn renderer_backend_default_enabled() -> bool {
+    std::env::var("GAUS_PREVIEW_RENDERER")
+        .map(|value| {
+            let lower = value.trim().to_ascii_lowercase();
+            matches!(lower.as_str(), "1" | "true" | "on" | "yes")
+        })
+        .unwrap_or(false)
+}
+
+fn readback_env_ring() -> usize {
+    std::env::var("GAUS_READBACK_RING")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|ring| ring.max(1))
+        .unwrap_or(4)
+}
+
+fn readback_min_interval(tag: &ReadbackTag, auto: bool) -> Duration {
+    match tag {
+        ReadbackTag::Scrub => {
+            if auto {
+                Duration::from_millis(160)
+            } else {
+                Duration::from_millis(60)
+            }
+        }
+        ReadbackTag::Capture => Duration::from_millis(0),
+        ReadbackTag::Thumbnail => Duration::from_millis(200),
+        ReadbackTag::Other(_) => Duration::from_millis(120),
+    }
+}
+
+fn readback_inflight_timeout(tag: &ReadbackTag) -> Duration {
+    match tag {
+        ReadbackTag::Capture => Duration::from_millis(800),
+        _ => Duration::from_millis(300),
+    }
+}
+
+fn readback_env_scale() -> f32 {
+    std::env::var("GAUS_READBACK_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(|scale| scale.clamp(0.1, 1.0))
+        .unwrap_or(0.5)
+}
+
+fn readback_env_interval() -> Option<Duration> {
+    std::env::var("GAUS_READBACK_FPS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .and_then(|fps| {
+            if fps > 0.0 {
+                let ms = (1000.0 / fps).round().max(1.0) as u64;
+                Some(Duration::from_millis(ms))
+            } else {
+                None
+            }
+        })
+}
+
+fn align_bytes_per_row(width: u32) -> u32 {
+    let base = width.max(1) * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    ((base + align - 1) / align) * align
+}
+
+const READBACK_DOWNSCALE_SHADER: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0)
+    );
+
+    var output: VertexOutput;
+    let pos = positions[idx];
+    output.position = vec4<f32>(pos, 0.0, 1.0);
+    output.uv = vec2<f32>((pos.x + 1.0) * 0.5, 1.0 - ((pos.y + 1.0) * 0.5));
+    return output;
+}
+
+@group(0) @binding(0)
+var input_tex: texture_2d<f32>;
+@group(0) @binding(1)
+var input_sampler: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(input_tex, input_sampler, clamp(in.uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0)));
+}
+"#;
 
 // Optimized video frame decode at native size (no scaling; GPU handles fit)
 fn decode_video_frame_optimized(
@@ -1468,10 +2308,12 @@ fn decode_video_frame_nv12_only(
     Some((YuvPixFmt::Nv12, y, uv, w, h))
 }
 
-pub(crate) fn device_supports_16bit_norm(rs: &eframe::egui_wgpu::RenderState) -> bool {
-    rs.device
-        .features()
-        .contains(eframe::wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+pub(crate) fn device_supports_16bit_norm(gpu: &GpuContext<'_>) -> bool {
+    gpu.with_device(|device| {
+        device
+            .features()
+            .contains(eframe::wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+    })
 }
 
 pub(crate) fn upload_plane(
@@ -1635,3 +2477,579 @@ struct FrameBuffer {
 }
 
 // (removed legacy standalone WGPU context to avoid mixed versions)
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewReadbackKind {
+    Renderer,
+    Legacy,
+}
+
+struct PreviewReadbackRequest<'a> {
+    tag: &'a ReadbackTag,
+    auto: bool,
+    phase: PlaybackPhase,
+    source: &'a ReadbackSource,
+    original_width: u32,
+    original_height: u32,
+    target_width: u32,
+    target_height: u32,
+    bytes_per_row: u32,
+    allow_blocking: bool,
+}
+
+#[derive(Debug)]
+enum ReadbackSubmission {
+    Submitted,
+    Completed(ReadbackResult),
+    Pending,
+}
+
+#[derive(Debug, Default)]
+struct ReadbackPoll {
+    forced_wait: bool,
+    had_pending: bool,
+}
+
+#[derive(Debug)]
+enum PreviewReadbackError {
+    Unsupported { reason: String },
+    SubmissionFailed { reason: String },
+}
+
+impl PreviewReadbackError {
+    fn unsupported(reason: impl Into<String>) -> Self {
+        PreviewReadbackError::Unsupported {
+            reason: reason.into(),
+        }
+    }
+
+    fn failed(reason: impl Into<String>) -> Self {
+        PreviewReadbackError::SubmissionFailed {
+            reason: reason.into(),
+        }
+    }
+
+    fn is_permanent(&self) -> bool {
+        matches!(self, PreviewReadbackError::Unsupported { .. })
+    }
+}
+
+trait PreviewReadback: Send {
+    fn kind(&self) -> PreviewReadbackKind;
+    fn name(&self) -> &'static str;
+    fn has_pending(&self) -> bool;
+    fn readback(
+        &mut self,
+        gpu: &GpuContext<'_>,
+        request: &PreviewReadbackRequest<'_>,
+    ) -> Result<ReadbackSubmission, PreviewReadbackError>;
+    fn poll(&mut self, gpu_sync: &GpuSyncController, phase: PlaybackPhase) -> ReadbackPoll;
+    fn try_recv(&mut self) -> Option<ReadbackResult>;
+    fn clear_for_realtime(&mut self);
+}
+
+struct ReadbackManagerBackend {
+    ring: usize,
+    manager: Option<ReadbackManager>,
+    downscale: Option<ReadbackDownscale>,
+    resolve: Option<ReadbackResolve>,
+}
+
+impl ReadbackManagerBackend {
+    fn new(ring: usize) -> Self {
+        Self {
+            ring,
+            manager: None,
+            downscale: None,
+            resolve: None,
+        }
+    }
+
+    fn ensure_manager(&mut self, gpu: &GpuContext<'_>) -> &mut ReadbackManager {
+        if self.manager.is_none() {
+            let ring = self.ring;
+            let created = gpu.with_device(|device| ReadbackManager::new(device, ring));
+            self.manager = Some(created);
+        }
+        self.manager.as_mut().expect("manager present")
+    }
+
+    fn ensure_downscale_pipeline(&mut self, gpu: &GpuContext<'_>) -> &ReadbackDownscale {
+        if self.downscale.is_none() {
+            let pipeline = gpu.with_device(|device| ReadbackDownscale::new(device));
+            self.downscale = Some(pipeline);
+        }
+        self.downscale.as_ref().expect("downscale pipeline")
+    }
+
+    fn ensure_resolve_texture(
+        &mut self,
+        gpu: &GpuContext<'_>,
+        width: u32,
+        height: u32,
+    ) -> &ReadbackResolve {
+        let recreate = self
+            .resolve
+            .as_ref()
+            .map(|existing| existing.width != width || existing.height != height)
+            .unwrap_or(true);
+        if recreate {
+            let texture = gpu.with_device(|device| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("readback-resolve"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            });
+            self.resolve = Some(ReadbackResolve {
+                texture: Arc::new(texture),
+                width,
+                height,
+            });
+        }
+        self.resolve.as_ref().expect("resolve texture")
+    }
+}
+
+impl PreviewReadback for ReadbackManagerBackend {
+    fn kind(&self) -> PreviewReadbackKind {
+        PreviewReadbackKind::Legacy
+    }
+
+    fn name(&self) -> &'static str {
+        "legacy_readback"
+    }
+
+    fn has_pending(&self) -> bool {
+        self.manager
+            .as_ref()
+            .map(|manager| manager.has_pending())
+            .unwrap_or(false)
+    }
+
+    fn readback(
+        &mut self,
+        gpu: &GpuContext<'_>,
+        request: &PreviewReadbackRequest<'_>,
+    ) -> Result<ReadbackSubmission, PreviewReadbackError> {
+        self.ensure_manager(gpu);
+
+        if !{
+            let manager = self.manager.as_mut().expect("manager present after ensure");
+            manager.phase_policy_allows(request.phase)
+        } {
+            return Ok(ReadbackSubmission::Pending);
+        }
+
+        let mut encoder = gpu.with_device(|device| {
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("readback-encoder"),
+            })
+        });
+
+        let mut src_texture: Arc<wgpu::Texture> = Arc::clone(&request.source.rgba_texture);
+        if request.target_width != request.original_width
+            || request.target_height != request.original_height
+        {
+            let resolve_texture = {
+                let resolve =
+                    self.ensure_resolve_texture(gpu, request.target_width, request.target_height);
+                Arc::clone(&resolve.texture)
+            };
+            let downscale = self.ensure_downscale_pipeline(gpu);
+
+            let resolve_view = resolve_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let src_view = request
+                .source
+                .rgba_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+
+            let bind_group = gpu.with_device(|device| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("readback-downscale-bg"),
+                    layout: &downscale.bind_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&src_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&downscale.sampler),
+                        },
+                    ],
+                })
+            });
+
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("readback-downscale"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &resolve_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&downscale.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            src_texture = resolve_texture;
+        }
+
+        let extent = wgpu::Extent3d {
+            width: request.target_width,
+            height: request.target_height,
+            depth_or_array_layers: 1,
+        };
+
+        let image_src = wgpu::ImageCopyTexture {
+            texture: &*src_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        };
+
+        let readback_request = ReadbackRequest {
+            extent,
+            bytes_per_row: request.bytes_per_row,
+            src: image_src,
+            tag: request.tag.clone(),
+        };
+
+        let Some(slot_idx) = ({
+            let manager_ref = self.manager.as_mut().expect("manager present after ensure");
+            gpu.with_device(|device| {
+                manager_ref.request_copy(device, &mut encoder, readback_request)
+            })
+        }) else {
+            return Ok(ReadbackSubmission::Pending);
+        };
+
+        info!(
+            target = "preview_readback",
+            backend = "legacy",
+            tag = ?request.tag,
+            width = request.target_width,
+            height = request.target_height,
+            slot = slot_idx,
+            "queued legacy preview readback"
+        );
+
+        gpu.gpu_sync().notify_work_submitted();
+        gpu.with_queue(|queue| queue.submit(std::iter::once(encoder.finish())));
+        crate::gpu_pump!(gpu, "readback_issue_submit");
+        if let Some(manager) = self.manager.as_mut() {
+            manager.schedule_map(slot_idx);
+            manager.mark_enqueued(request.phase);
+        }
+
+        Ok(ReadbackSubmission::Submitted)
+    }
+
+    fn poll(&mut self, gpu_sync: &GpuSyncController, _phase: PlaybackPhase) -> ReadbackPoll {
+        let mut poll = ReadbackPoll {
+            forced_wait: false,
+            had_pending: self.has_pending(),
+        };
+
+        if let Some(manager) = self.manager.as_mut() {
+            let wait = manager.poll(gpu_sync);
+            if wait {
+                poll.forced_wait = true;
+            }
+        }
+
+        poll
+    }
+
+    fn try_recv(&mut self) -> Option<ReadbackResult> {
+        self.manager.as_mut()?.try_recv()
+    }
+
+    fn clear_for_realtime(&mut self) {
+        self.manager = None;
+        self.downscale = None;
+        self.resolve = None;
+    }
+}
+
+struct RendererReadbackBackend {
+    resources: Option<PreviewReadbackResources>,
+    failure_count: u32,
+    disabled: bool,
+}
+
+impl RendererReadbackBackend {
+    fn new(_options: RendererBackendOptions) -> Self {
+        Self {
+            resources: None,
+            failure_count: 0,
+            disabled: false,
+        }
+    }
+
+    fn ensure_resources(
+        &mut self,
+        gpu: &GpuContext<'_>,
+    ) -> Result<&mut PreviewReadbackResources, renderer::RendererError> {
+        if self.resources.is_none() {
+            let created = gpu.with_device(|device| PreviewReadbackResources::new(device));
+            self.resources = Some(created?);
+        }
+        self.resources.as_mut().ok_or_else(|| {
+            renderer::RendererError::InvalidFormat("failed to create renderer resources".into())
+        })
+    }
+
+    fn handle_error(&mut self, err: renderer::RendererError) -> PreviewReadbackError {
+        match err {
+            renderer::RendererError::InvalidFormat(reason) => {
+                self.disabled = true;
+                warn!(target = "preview_readback", reason = %reason, "renderer readback disabled due to invalid format");
+                PreviewReadbackError::unsupported(reason)
+            }
+            other => {
+                self.failure_count += 1;
+                error!(target = "preview_readback", error = %other, failures = self.failure_count, "renderer readback submission failed");
+                if self.failure_count >= 3 {
+                    self.disabled = true;
+                    PreviewReadbackError::unsupported(format!(
+                        "renderer failed after {} attempts",
+                        self.failure_count
+                    ))
+                } else {
+                    PreviewReadbackError::failed(other.to_string())
+                }
+            }
+        }
+    }
+}
+
+impl PreviewReadback for RendererReadbackBackend {
+    fn kind(&self) -> PreviewReadbackKind {
+        PreviewReadbackKind::Renderer
+    }
+
+    fn name(&self) -> &'static str {
+        "renderer_readback"
+    }
+
+    fn has_pending(&self) -> bool {
+        false
+    }
+
+    fn readback(
+        &mut self,
+        gpu: &GpuContext<'_>,
+        request: &PreviewReadbackRequest<'_>,
+    ) -> Result<ReadbackSubmission, PreviewReadbackError> {
+        if self.disabled {
+            return Err(PreviewReadbackError::unsupported(
+                "renderer backend disabled",
+            ));
+        }
+
+        let resources = match self.ensure_resources(gpu) {
+            Ok(res) => res,
+            Err(err) => return Err(self.handle_error(err)),
+        };
+
+        let rgba_view = request
+            .source
+            .rgba_texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let y_view = request
+            .source
+            .y_plane
+            .as_ref()
+            .map(|tex| tex.create_view(&wgpu::TextureViewDescriptor::default()));
+        let uv_view = request
+            .source
+            .uv_plane
+            .as_ref()
+            .map(|tex| tex.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        let (pixel_format, textures) = if let (Some(fmt), Some(y), Some(uv)) =
+            (request.source.format, y_view.as_ref(), uv_view.as_ref())
+        {
+            match fmt {
+                YuvPixFmt::Nv12 => (
+                    RendererPixelFormat::Nv12,
+                    PreviewTextureSource::Nv12 {
+                        y_plane: y,
+                        uv_plane: uv,
+                    },
+                ),
+                YuvPixFmt::P010 => (
+                    RendererPixelFormat::P010,
+                    PreviewTextureSource::P010 {
+                        y_plane: y,
+                        uv_plane: uv,
+                    },
+                ),
+            }
+        } else {
+            (
+                RendererPixelFormat::Rgba8,
+                PreviewTextureSource::Rgba {
+                    texture: &rgba_view,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                },
+            )
+        };
+
+        let downscale = if request.target_width != request.original_width
+            || request.target_height != request.original_height
+        {
+            Some(PreviewDownscale {
+                width: request.target_width,
+                height: request.target_height,
+            })
+        } else {
+            None
+        };
+
+        let color_space = match pixel_format {
+            RendererPixelFormat::Rgba8 => RendererColorSpace::Srgb,
+            _ => RendererColorSpace::Rec709,
+        };
+
+        let input = PreviewFrameInput {
+            width: request.original_width,
+            height: request.original_height,
+            color_space,
+            pixel_format,
+            textures,
+            downscale,
+            gpu_sync: Some(gpu.gpu_sync()),
+        };
+
+        let frame = gpu
+            .with_device(|device| {
+                gpu.with_queue(|queue| {
+                    resources.render_to_cpu(device, queue, &input, |reason| {
+                        trace!(target = "preview_renderer_readback", reason);
+                        if request.allow_blocking {
+                            gpu.gpu_sync().service_gpu("renderer_readback_wait");
+                        } else {
+                            gpu.gpu_sync().poll_nonblocking();
+                        }
+                    })
+                })
+            })
+            .map_err(|err| self.handle_error(err))?;
+
+        let aligned_bytes = align_bytes_per_row(request.target_width) as usize;
+        let row_bytes = frame.bytes_per_row as usize;
+        let pixels = if aligned_bytes == row_bytes {
+            frame.pixels
+        } else {
+            let mut padded = vec![0u8; aligned_bytes * (request.target_height as usize)];
+            for row in 0..(request.target_height as usize) {
+                let src_off = row * row_bytes;
+                let dst_off = row * aligned_bytes;
+                padded[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&frame.pixels[src_off..src_off + row_bytes]);
+            }
+            padded
+        };
+
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or_default();
+
+        let result = ReadbackResult {
+            tag: request.tag.clone(),
+            pixels,
+            extent: wgpu::Extent3d {
+                width: request.target_width,
+                height: request.target_height,
+                depth_or_array_layers: 1,
+            },
+            bytes_per_row: align_bytes_per_row(request.target_width),
+            timestamp_ns,
+        };
+
+        self.failure_count = 0;
+        Ok(ReadbackSubmission::Completed(result))
+    }
+
+    fn poll(&mut self, _gpu_sync: &GpuSyncController, _phase: PlaybackPhase) -> ReadbackPoll {
+        ReadbackPoll {
+            forced_wait: false,
+            had_pending: false,
+        }
+    }
+
+    fn try_recv(&mut self) -> Option<ReadbackResult> {
+        None
+    }
+
+    fn clear_for_realtime(&mut self) {
+        self.failure_count = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_renderer_options() -> RendererBackendOptions {
+        let settings = PreviewReadbackSettings {
+            ring: 4,
+            scale: 1.0,
+            auto_interval: None,
+        };
+        RendererBackendOptions::new(settings, Duration::from_millis(100))
+    }
+
+    #[test]
+    fn renderer_backend_disables_on_invalid_format() {
+        let mut backend = RendererReadbackBackend::new(test_renderer_options());
+        let result =
+            backend.handle_error(renderer::RendererError::InvalidFormat("bad format".into()));
+        assert!(backend.disabled);
+        assert!(matches!(result, PreviewReadbackError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn renderer_backend_requires_multiple_failures_before_disable() {
+        let mut backend = RendererReadbackBackend::new(test_renderer_options());
+        for _ in 0..2 {
+            let result = backend.handle_error(renderer::RendererError::ShaderCompilation(
+                "shaders failed".into(),
+            ));
+            assert!(matches!(
+                result,
+                PreviewReadbackError::SubmissionFailed { .. }
+            ));
+            assert!(!backend.disabled);
+        }
+
+        let result = backend.handle_error(renderer::RendererError::ShaderCompilation(
+            "shaders failed again".into(),
+        ));
+        assert!(backend.disabled);
+        assert!(matches!(result, PreviewReadbackError::Unsupported { .. }));
+    }
+}

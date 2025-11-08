@@ -19,7 +19,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // VideoToolbox bindings
 extern "C" {
@@ -112,6 +112,10 @@ extern "C" {
     fn avfoundation_peek_first_sample_pts(ctx: *mut AVFoundationContext) -> f64;
     fn avfoundation_release_context(ctx: *mut AVFoundationContext);
     fn avfoundation_create_destination_attributes() -> *const c_void;
+    fn avfoundation_create_destination_attributes_scaled(
+        width: c_int,
+        height: c_int,
+    ) -> *const c_void;
 
     // Uncaught exception handler
     fn avf_install_uncaught_exception_handler();
@@ -300,6 +304,24 @@ impl DecodedFrameBuffer {
         }
         self.frames[self.read_index].as_ref()
     }
+
+    fn clear(&mut self) {
+        for slot in self.frames.iter_mut() {
+            if let Some(frame) = slot.take() {
+                if !frame.pixel_buffer.is_null() {
+                    unsafe {
+                        CFRelease(frame.pixel_buffer);
+                    }
+                }
+            }
+        }
+        self.write_index = 0;
+        self.read_index = 0;
+        self.count = 0;
+        self.fed_samples = 0;
+        self.cb_frames = 0;
+        self.last_cb_pts = f64::NAN;
+    }
 }
 
 /// VideoToolbox decoder implementation
@@ -324,6 +346,7 @@ pub struct VideoToolboxDecoder {
     decoded_frame_buffer_raw: *const std::sync::Mutex<DecodedFrameBuffer>,
     iosurface_frame_buffer_raw: *const std::sync::Mutex<DecodedFrameBuffer>,
     reader_started: bool,
+    interactive: bool,
 }
 
 unsafe impl Send for VideoToolboxDecoder {}
@@ -673,6 +696,7 @@ impl VideoToolboxDecoder {
             decoded_frame_buffer_raw,
             iosurface_frame_buffer_raw,
             reader_started: false,
+            interactive: false,
         };
         // Start AVFoundation reader exactly once
         let start_ok = unsafe { avfoundation_start_reader(dec.avfoundation_ctx) };
@@ -686,8 +710,24 @@ impl VideoToolboxDecoder {
     /// Create destination image buffer attributes
     fn create_destination_attributes() -> Result<*const c_void> {
         debug!("Creating destination attributes via Objective-C shim");
+        Self::create_destination_attributes_internal(None)
+    }
 
-        let attributes = unsafe { avfoundation_create_destination_attributes() };
+    fn create_destination_attributes_scaled(width: i32, height: i32) -> Result<*const c_void> {
+        debug!(
+            "Creating scaled destination attributes via Objective-C shim ({}x{})",
+            width, height
+        );
+        Self::create_destination_attributes_internal(Some((width, height)))
+    }
+
+    fn create_destination_attributes_internal(dims: Option<(i32, i32)>) -> Result<*const c_void> {
+        let attributes = unsafe {
+            match dims {
+                Some((w, h)) => avfoundation_create_destination_attributes_scaled(w, h),
+                None => avfoundation_create_destination_attributes(),
+            }
+        };
 
         if attributes.is_null() {
             return Err(anyhow::anyhow!("Failed to create destination attributes"));
@@ -695,6 +735,98 @@ impl VideoToolboxDecoder {
 
         debug!("Successfully created destination attributes");
         Ok(attributes)
+    }
+
+    fn apply_interactive_mode(&mut self, interactive: bool) -> Result<()> {
+        if self.interactive == interactive {
+            return Ok(());
+        }
+
+        // Determine scaled dimensions when entering interactive mode
+        let (scaled_w, scaled_h) = if interactive {
+            let scale = 0.5_f32;
+            let mut w = (self.properties.width as f32 * scale).round() as i32;
+            let mut h = (self.properties.height as f32 * scale).round() as i32;
+            w = w.max(2);
+            h = h.max(2);
+            if w % 2 != 0 {
+                w -= 1;
+            }
+            if h % 2 != 0 {
+                h -= 1;
+            }
+            (w, h)
+        } else {
+            (0, 0)
+        };
+
+        let new_attrs = if interactive {
+            Self::create_destination_attributes_scaled(scaled_w, scaled_h)?
+        } else {
+            Self::create_destination_attributes()?
+        };
+
+        unsafe {
+            if !self.session.is_null() {
+                VTDecompressionSessionWaitForAsynchronousFrames(self.session);
+                VTDecompressionSessionInvalidate(self.session);
+                self.session = ptr::null_mut();
+            }
+        }
+
+        let old_attrs = self.destination_attributes;
+        let mut session: *mut c_void = ptr::null_mut();
+        let status = unsafe {
+            avf_vt_create_session(
+                self.format_description as *mut _,
+                new_attrs as *const _,
+                vt_decompression_output_callback,
+                self.decoded_frame_buffer_raw as *mut _,
+                &mut session as *mut *mut _,
+            )
+        };
+
+        if status != 0 || session.is_null() {
+            unsafe {
+                CFRelease(new_attrs as *mut c_void);
+            }
+            return Err(anyhow::anyhow!(
+                "Failed to recreate VTDecompressionSession (status={})",
+                status
+            ));
+        }
+
+        unsafe {
+            if !old_attrs.is_null() {
+                CFRelease(old_attrs as *mut c_void);
+            }
+        }
+
+        self.session = session;
+        self.destination_attributes = new_attrs;
+        self.interactive = interactive;
+
+        if interactive {
+            self.zero_copy_enabled = false;
+        } else {
+            self.zero_copy_enabled = self.config.zero_copy && !self.iosurface_session.is_null();
+        }
+
+        if let Ok(mut buffer) = self.decoded_frame_buffer.lock() {
+            buffer.clear();
+        }
+        if let Ok(mut buffer) = self.iosurface_frame_buffer.lock() {
+            buffer.clear();
+        }
+        if let Ok(mut cache) = self.frame_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.iosurface_cache.lock() {
+            cache.clear();
+        }
+
+        debug!("VideoToolbox interactive mode set to {}", interactive);
+        Ok(())
     }
 
     /// Convert CVPixelBufferRef to VideoFrame
@@ -1378,6 +1510,10 @@ impl NativeVideoDecoder for VideoToolboxDecoder {
     fn fed_samples(&self) -> usize {
         self.fed_samples()
     }
+
+    fn set_interactive(&mut self, interactive: bool) -> Result<()> {
+        self.apply_interactive_mode(interactive)
+    }
 }
 
 // Drop implementation is already defined above
@@ -1389,6 +1525,13 @@ pub fn create_videotoolbox_decoder<P: AsRef<Path>>(
 ) -> Result<Box<dyn NativeVideoDecoder>> {
     let decoder =
         VideoToolboxDecoder::new(path, config).context("Failed to create VideoToolbox decoder")?;
+
+    info!(
+        width = decoder.properties.width,
+        height = decoder.properties.height,
+        zero_copy = decoder.config.zero_copy,
+        "native decoder: VideoToolbox initialized"
+    );
 
     Ok(Box::new(decoder))
 }

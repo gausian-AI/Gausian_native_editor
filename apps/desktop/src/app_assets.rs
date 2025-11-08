@@ -20,7 +20,9 @@ fn asset_timeline_duration(asset: &AssetRow, fps: timeline_crate::Fps) -> i64 {
         return asset.duration_frames.unwrap_or(150).max(1);
     }
 
-    if let (Some(frames), Some(num), Some(den)) = (asset.duration_frames, asset.fps_num, asset.fps_den) {
+    if let (Some(frames), Some(num), Some(den)) =
+        (asset.duration_frames, asset.fps_num, asset.fps_den)
+    {
         if num > 0 && den > 0 {
             let asset_fps = (num as f64) / (den as f64);
             if asset_fps > 0.0 {
@@ -40,10 +42,7 @@ fn asset_timeline_duration(asset: &AssetRow, fps: timeline_crate::Fps) -> i64 {
     timeline_frames.max(1)
 }
 
-fn track_end(
-    graph: &timeline_crate::TimelineGraph,
-    binding: &timeline_crate::TrackBinding,
-) -> i64 {
+fn track_end(graph: &timeline_crate::TimelineGraph, binding: &timeline_crate::TrackBinding) -> i64 {
     binding
         .node_ids
         .iter()
@@ -74,7 +73,7 @@ where
         .iter()
         .enumerate()
         .filter(|(_, track)| predicate(&track.kind))
-        .min_by_key(|(idx, _)| ( (*idx as isize - pref).abs() as usize))
+        .min_by_key(|(idx, _)| ((*idx as isize - pref).abs() as usize))
         .map(|(idx, track)| (idx, track.clone()))
 }
 
@@ -102,13 +101,7 @@ fn collect_target_tracks(
     let video_track = nearest_track_by_kind(app, preferred_track, |kind| {
         !matches!(kind, timeline_crate::TrackKind::Audio)
     })
-    .or_else(|| {
-        app.seq
-            .graph
-            .tracks
-            .get(0)
-            .map(|track| (0, track.clone()))
-    });
+    .or_else(|| app.seq.graph.tracks.get(0).map(|track| (0, track.clone())));
 
     if let Some(v) = &video_track {
         targets.push(v.clone());
@@ -148,17 +141,16 @@ pub(super) fn load_thumb_texture(
     if let Ok(img) = image::open(&thumb_path) {
         let resized = img.resize(desired_w, desired_h, image::imageops::FilterType::Triangle);
         let rgba = resized.to_rgba8();
-    let (w, h) = rgba.dimensions();
-        let color = egui::ColorImage::from_rgba_unmultiplied(
-            [w as usize, h as usize],
-            &rgba.into_raw(),
-        );
+        let (w, h) = rgba.dimensions();
+        let color =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba.into_raw());
         let tex = ctx.load_texture(
             format!("asset_thumb_{}", asset.id),
             color,
             egui::TextureOptions::LINEAR,
         );
-        app.asset_thumb_textures.insert(asset.id.clone(), tex.clone());
+        app.asset_thumb_textures
+            .insert(asset.id.clone(), tex.clone());
         Some(tex)
     } else {
         None
@@ -204,7 +196,16 @@ impl App {
         project_id: &str,
         files: &[std::path::PathBuf],
     ) -> anyhow::Result<()> {
-        self::import_files_for(self, project_id, files)
+        self::import_files_for(self, project_id, files, None)
+    }
+
+    pub(crate) fn import_files_for_with_metadata(
+        &mut self,
+        project_id: &str,
+        files: &[std::path::PathBuf],
+        metadata: Option<std::collections::HashMap<std::path::PathBuf, serde_json::Value>>,
+    ) -> anyhow::Result<()> {
+        self::import_files_for(self, project_id, files, metadata)
     }
 
     pub(crate) fn assets(&self) -> Vec<AssetRow> {
@@ -284,13 +285,14 @@ pub(super) fn export_sequence(app: &mut App) {
 
 pub(super) fn import_files(app: &mut App, files: &[PathBuf]) -> anyhow::Result<()> {
     let pid = app.project_id.clone();
-    import_files_for(app, &pid, files)
+    import_files_for(app, &pid, files, None)
 }
 
 pub(super) fn import_files_for(
     app: &mut App,
     project_id: &str,
     files: &[PathBuf],
+    metadata: Option<std::collections::HashMap<PathBuf, serde_json::Value>>,
 ) -> anyhow::Result<()> {
     use anyhow::Result;
     if files.is_empty() {
@@ -300,21 +302,22 @@ pub(super) fn import_files_for(
     if let Some(base) = ancestor.as_deref() {
         app.db.set_project_base_path(project_id, base)?;
     }
+    let metadata_map = std::sync::Arc::new(metadata.unwrap_or_default());
     let db_path = app.db.path().to_path_buf();
     let project_id = project_id.to_string();
     for f in files.to_vec() {
         let base = ancestor.clone();
         let db_path = db_path.clone();
         let project_id = project_id.clone();
-        let jobs = app.jobs.clone();
+        let metadata_map = metadata_map.clone();
         let h = std::thread::spawn(move || {
             let db = project::ProjectDb::open_or_create(&db_path).expect("open db");
-            match media_io::probe_media(&f) {
+            match crate::media_info::probe_media_info(&f) {
                 Ok(info) => {
                     let kind = match info.kind {
-                        media_io::MediaKind::Video => "video",
-                        media_io::MediaKind::Image => "image",
-                        media_io::MediaKind::Audio => "audio",
+                        crate::media_info::MediaKind::Video => "video",
+                        crate::media_info::MediaKind::Image => "image",
+                        crate::media_info::MediaKind::Audio => "audio",
                     };
                     let rel = base.as_deref().and_then(|b| pathdiff::diff_paths(&f, b));
                     let fps_num = info.fps_num.map(|v| v as i64);
@@ -325,6 +328,8 @@ pub(super) fn import_files_for(
                         }
                         _ => None,
                     };
+                    let comfy_meta = metadata_map.get(&f).cloned();
+                    let meta_json = comfy_meta.map(|value| value.to_string());
                     let asset_id = db
                         .insert_asset_row(
                             &project_id,
@@ -338,36 +343,19 @@ pub(super) fn import_files_for(
                             fps_den,
                             info.audio_channels.map(|x| x as i64),
                             info.sample_rate.map(|x| x as i64),
+                            info.duration_seconds,
+                            info.codec.as_deref(),
+                            info.bitrate_mbps,
+                            info.bit_depth.map(|x| x as i64),
+                            info.is_hdr,
+                            info.is_variable_framerate,
+                            meta_json.as_deref(),
                         )
                         .unwrap_or_default();
-                    if let Some(j) = jobs {
-                        use jobs_crate::{JobKind, JobSpec};
-                        for kind in [
-                            JobKind::Waveform,
-                            JobKind::Thumbnails,
-                            JobKind::Proxy,
-                            JobKind::SeekIndex,
-                        ] {
-                            let id = j.enqueue(JobSpec {
-                                asset_id: asset_id.clone(),
-                                kind,
-                                priority: 0,
-                            });
-                            let _ = db.enqueue_job(
-                                &id,
-                                &asset_id,
-                                match kind {
-                                    JobKind::Waveform => "waveform",
-                                    JobKind::Thumbnails => "thumbs",
-                                    JobKind::Proxy => "proxy",
-                                    JobKind::SeekIndex => "seekidx",
-                                },
-                                0,
-                            );
-                        }
-                    }
                 }
-                Err(e) => eprintln!("ffprobe failed for {:?}: {e}", f),
+                Err(err) => {
+                    eprintln!("Import probe failed {}: {}", f.to_string_lossy(), err);
+                }
             }
         });
         app.import_workers.push(h);
@@ -376,9 +364,7 @@ pub(super) fn import_files_for(
 }
 
 pub(super) fn assets(app: &App) -> Vec<project::AssetRow> {
-    app.db
-        .list_assets(&app.project_id)
-        .unwrap_or_default()
+    app.db.list_assets(&app.project_id).unwrap_or_default()
 }
 
 pub(super) fn add_asset_to_timeline(app: &mut App, asset: &project::AssetRow) {
@@ -443,6 +429,8 @@ pub(super) fn add_asset_to_timeline(app: &mut App, asset: &project::AssetRow) {
             let item_idx = track.items.len().saturating_sub(1);
             app.selected = Some((track_idx, item_idx));
         }
+
+        app.prime_asset_for_timeline(asset);
     }
 }
 

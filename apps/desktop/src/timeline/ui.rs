@@ -90,6 +90,42 @@ impl App {
         linked
     }
 
+
+    fn clip_media_fps(&self, clip: &ClipNode) -> Fps {
+        if let Value::Object(map) = &clip.metadata {
+            let num = map
+                .get("media_fps_num")
+                .and_then(|v| v.as_i64())
+                .filter(|n| *n > 0)
+                .map(|n| n as u32);
+            let den = map
+                .get("media_fps_den")
+                .and_then(|v| v.as_i64())
+                .filter(|d| *d > 0)
+                .map(|d| d as u32);
+            if let (Some(num), Some(den)) = (num, den) {
+                if num > 0 && den > 0 {
+                    return Fps { num, den };
+                }
+            }
+        }
+
+        if let Some(path) = clip.asset_id.as_deref() {
+            if let Ok(Some(asset)) = self.db.find_asset_by_path(&self.project_id, path) {
+                if let (Some(num), Some(den)) = (asset.fps_num, asset.fps_den) {
+                    if num > 0 && den > 0 {
+                        return Fps {
+                            num: num as u32,
+                            den: den as u32,
+                        };
+                    }
+                }
+            }
+        }
+
+        self.seq.fps
+    }
+
     pub(crate) fn display_info_for_node(
         node: &TimelineNode,
         track_kind: &TrackKind,
@@ -176,7 +212,12 @@ impl App {
             .tracks
             .get(drag.original_track_index)
             .map(|t| t.kind.clone());
-        let target_kind = self.seq.graph.tracks.get(target_track).map(|t| t.kind.clone());
+        let target_kind = self
+            .seq
+            .graph
+            .tracks
+            .get(target_track)
+            .map(|t| t.kind.clone());
         if let (Some(orig), Some(target)) = (original_kind, target_kind) {
             let orig_is_audio = matches!(orig, TrackKind::Audio);
             let target_is_audio = matches!(target, TrackKind::Audio);
@@ -1046,7 +1087,6 @@ impl App {
                 if let Some(drag) = completed_drag.take() {
                     self.finish_drag(drag);
                 }
-
                 // Defer any peak requests until after immutable borrows end
                 for p in to_request {
                     self.request_audio_peaks(&p);

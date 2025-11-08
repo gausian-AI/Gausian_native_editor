@@ -119,9 +119,67 @@ impl ComfyUiManager {
         &self.cfg
     }
 
+    fn resolve_host_port(&self) -> (String, u16) {
+        let mut host_input = self.cfg.host.trim();
+        if host_input.is_empty() {
+            return ("127.0.0.1".into(), self.cfg.port);
+        }
+        while host_input.ends_with('/') {
+            host_input = &host_input[..host_input.len() - 1];
+        }
+        let parse_target = if host_input.contains("://") {
+            host_input.to_string()
+        } else {
+            format!("http://{host_input}")
+        };
+        if let Ok(url) = url::Url::parse(&parse_target) {
+            let host = url.host_str().unwrap_or("127.0.0.1").to_string();
+            let port = url.port().unwrap_or(self.cfg.port);
+            (host, port)
+        } else {
+            (host_input.to_string(), self.cfg.port)
+        }
+    }
+
+    fn format_host_for_addr(host: &str) -> String {
+        if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        }
+    }
+
+    pub fn set_host_input(&mut self, value: String) {
+        self.cfg.host = value;
+        // Update stored port if user included one in the host field.
+        let mut host_input = self.cfg.host.trim();
+        while host_input.ends_with('/') {
+            host_input = &host_input[..host_input.len() - 1];
+        }
+        let parse_target = if host_input.contains("://") {
+            host_input.to_string()
+        } else {
+            format!("http://{host_input}")
+        };
+        if let Ok(url) = url::Url::parse(&parse_target) {
+            if let Some(port) = url.port() {
+                // Clamp into the valid range; prevent zero.
+                let port = port.max(1);
+                self.cfg.port = port;
+            }
+        }
+    }
+
     pub fn url(&self) -> String {
         let scheme = if self.cfg.https { "https" } else { "http" };
-        format!("{}://{}:{}", scheme, self.cfg.host, self.cfg.port)
+        let (host, port) = self.resolve_host_port();
+        let host_fmt = Self::format_host_for_addr(&host);
+        let default_port = if self.cfg.https { 443 } else { 80 };
+        if port == default_port {
+            format!("{scheme}://{}", host_fmt.trim_matches(['[', ']']))
+        } else {
+            format!("{scheme}://{host_fmt}:{port}")
+        }
     }
 
     pub fn default_install_dir() -> PathBuf {
@@ -154,8 +212,8 @@ impl ComfyUiManager {
     }
 
     pub fn is_port_open(&self) -> bool {
-        let addr = format!("127.0.0.1:{}", self.cfg.port);
-        (addr.as_str(), self.cfg.port)
+        let (host, port) = self.resolve_host_port();
+        (host.as_str(), port)
             .to_socket_addrs()
             .ok()
             .and_then(|mut it| it.next())

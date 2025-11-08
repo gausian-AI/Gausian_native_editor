@@ -1,5 +1,0 @@
-modal
-boto3
-requests
-Pillow
-fastapi

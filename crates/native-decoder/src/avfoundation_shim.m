@@ -2,6 +2,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <CoreVideo/CoreVideo.h>
 #import <mach/mach_time.h>
 #import <stdlib.h>
 #import <string.h>
@@ -343,12 +344,21 @@ void* avfoundation_copy_track_format_desc(AVFoundationContext* ctx) {
 
 // Create destination attributes for VideoToolbox decompression
 const void* avfoundation_create_destination_attributes(void) {
+    return avfoundation_create_destination_attributes_scaled(0, 0);
+}
+
+const void* avfoundation_create_destination_attributes_scaled(int width, int height) {
     @autoreleasepool {
         @try {
-            // Request NV12 format (420YpCbCr8BiPlanarVideoRange)
-            NSDictionary* attrs = @{
+            NSMutableDictionary* attrs = [@{
                 (NSString*)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
-            };
+            } mutableCopy];
+
+            if (width > 0 && height > 0) {
+                attrs[(NSString*)kCVPixelBufferWidthKey] = @(width);
+                attrs[(NSString*)kCVPixelBufferHeightKey] = @(height);
+            }
+
             return (__bridge_retained CFDictionaryRef)attrs;
         } @catch (NSException* e) {
             log_exception(__func__, e);

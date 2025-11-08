@@ -7,8 +7,8 @@ use crate::timeline_crate::{
 };
 use serde_json::Value;
 
-use super::App;
 use super::app_project;
+use super::App;
 
 pub(super) fn apply_timeline_command_impl(
     app: &mut App,
@@ -179,14 +179,10 @@ pub(super) fn build_audio_clips_impl(app: &mut App) -> anyhow::Result<Vec<Active
             let mut timeline_dur =
                 crate::timeline::ui::frames_to_seconds(clip.timeline_range.duration, seq_fps);
             let media_fps = clip_media_fps(app, clip);
-            let mut media_start = crate::timeline::ui::frames_to_seconds(
-                clip.media_range.start,
-                media_fps,
-            );
-            let media_range_duration = crate::timeline::ui::frames_to_seconds(
-                clip.media_range.duration,
-                media_fps,
-            );
+            let mut media_start =
+                crate::timeline::ui::frames_to_seconds(clip.media_range.start, media_fps);
+            let media_range_duration =
+                crate::timeline::ui::frames_to_seconds(clip.media_range.duration, media_fps);
             let rate = clip.playback_rate.max(0.0001) as f64;
             timeline_dur /= rate;
             media_start /= rate;
@@ -261,7 +257,9 @@ pub(super) fn active_video_media_time_graph_impl(
             continue;
         }
         for node_id in &binding.node_ids {
-            let Some(node) = app.seq.graph.nodes.get(node_id) else { continue };
+            let Some(node) = app.seq.graph.nodes.get(node_id) else {
+                continue;
+            };
             let clip = match &node.kind {
                 TimelineNodeKind::Clip(c) => c,
                 _ => continue,
@@ -269,14 +267,15 @@ pub(super) fn active_video_media_time_graph_impl(
             if playhead < clip.timeline_range.start || playhead >= clip.timeline_range.end() {
                 continue;
             }
-            let Some(path) = clip.asset_id.clone() else { continue };
+            let Some(path) = clip.asset_id.clone() else {
+                continue;
+            };
             let start_on_timeline_sec = clip.timeline_range.start as f64 / seq_fps;
             let local_t = (timeline_sec - start_on_timeline_sec).max(0.0);
             let media_fps = clip_media_fps(app, clip);
-            let media_sec = crate::timeline::ui::frames_to_seconds(
-                clip.media_range.start,
-                media_fps,
-            ) + local_t * clip.playback_rate as f64;
+            let media_sec =
+                crate::timeline::ui::frames_to_seconds(clip.media_range.start, media_fps)
+                    + local_t * clip.playback_rate as f64;
             return Some((path, media_sec));
         }
     }
@@ -294,7 +293,9 @@ pub(super) fn active_audio_media_time_graph_impl(
             continue;
         }
         for node_id in &binding.node_ids {
-            let Some(node) = app.seq.graph.nodes.get(node_id) else { continue };
+            let Some(node) = app.seq.graph.nodes.get(node_id) else {
+                continue;
+            };
             let clip = match &node.kind {
                 TimelineNodeKind::Clip(c) => c,
                 _ => continue,
@@ -302,14 +303,15 @@ pub(super) fn active_audio_media_time_graph_impl(
             if playhead < clip.timeline_range.start || playhead >= clip.timeline_range.end() {
                 continue;
             }
-            let Some(path) = clip.asset_id.clone() else { continue };
+            let Some(path) = clip.asset_id.clone() else {
+                continue;
+            };
             let start_on_timeline_sec = clip.timeline_range.start as f64 / seq_fps;
             let local_t = (timeline_sec - start_on_timeline_sec).max(0.0);
             let media_fps = clip_media_fps(app, clip);
-            let media_sec = crate::timeline::ui::frames_to_seconds(
-                clip.media_range.start,
-                media_fps,
-            ) + local_t * clip.playback_rate as f64;
+            let media_sec =
+                crate::timeline::ui::frames_to_seconds(clip.media_range.start, media_fps)
+                    + local_t * clip.playback_rate as f64;
             return Some((path, media_sec));
         }
     }
@@ -348,17 +350,11 @@ impl App {
         self::build_audio_clips_impl(self)
     }
 
-    pub(crate) fn active_video_media_time_graph(
-        &self,
-        timeline_sec: f64,
-    ) -> Option<(String, f64)> {
+    pub(crate) fn active_video_media_time_graph(&self, timeline_sec: f64) -> Option<(String, f64)> {
         self::active_video_media_time_graph_impl(self, timeline_sec)
     }
 
-    pub(crate) fn active_audio_media_time_graph(
-        &self,
-        timeline_sec: f64,
-    ) -> Option<(String, f64)> {
+    pub(crate) fn active_audio_media_time_graph(&self, timeline_sec: f64) -> Option<(String, f64)> {
         self::active_audio_media_time_graph_impl(self, timeline_sec)
     }
 

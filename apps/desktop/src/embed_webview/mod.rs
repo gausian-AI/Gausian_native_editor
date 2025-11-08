@@ -14,10 +14,10 @@ pub trait WebViewHost {
     fn set_visible(&mut self, vis: bool);
     fn is_visible(&self) -> bool;
     fn reload(&mut self);
-    fn set_devtools(&mut self, enabled: bool);
-    // Best-effort: try to open developer inspector if supported. Returns true on success.
-    fn open_inspector(&mut self) -> bool;
     fn close(&mut self);
+    fn focus(&mut self) {}
+    fn paste_from_clipboard(&mut self) {}
+    fn insert_text(&mut self, _text: &str) {}
 }
 
 #[cfg(all(target_os = "macos", feature = "embed-webview"))]

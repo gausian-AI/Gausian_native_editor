@@ -6,7 +6,7 @@
 use super::*;
 use anyhow::{anyhow, Context};
 use std::path::Path;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Fallback decoder implementation
 pub struct FallbackDecoder {
@@ -75,6 +75,7 @@ pub fn create_fallback_decoder<P: AsRef<Path>>(
 ) -> Result<Box<dyn NativeVideoDecoder>> {
     let decoder =
         FallbackDecoder::new(path, config).context("Failed to create fallback decoder")?;
+    info!("native decoder: software fallback initialized");
 
     Ok(Box::new(decoder))
 }

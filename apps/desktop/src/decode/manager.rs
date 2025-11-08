@@ -11,15 +11,19 @@ use native_decoder::{
 use media_io::YuvPixFmt;
 
 use super::worker::{
-    spawn_worker, DecodeCmd, DecodeWorkerRuntime, LatestFrameSlot, VideoFrameOut,
+    spawn_worker, DecodeCmd, DecodeWorkerRuntime, LatestFrameSlot, VideoFrameOut, WorkerStats,
     PREFETCH_BUDGET_PER_TICK,
 };
 use eframe::egui::Context as EguiContext;
+use tracing::info;
 
 #[derive(Default)]
 pub(crate) struct DecodeManager {
     decoders: HashMap<String, DecoderEntry>,
     workers: HashMap<String, DecodeWorkerRuntime>,
+    interactive_states: HashMap<String, bool>,
+    worker_clip_ids: HashMap<String, Option<String>>,
+    worker_stats: HashMap<String, Arc<Mutex<WorkerStats>>>,
 }
 
 struct DecoderEntry {
@@ -31,6 +35,10 @@ struct DecoderEntry {
     attempts_this_tick: u32,
     fed_samples: usize,
     draws: u32,
+}
+
+pub(crate) struct WorkerStatsSnapshot {
+    pub first_frame_ms: Option<u64>,
 }
 
 impl DecodeManager {
@@ -248,12 +256,45 @@ impl DecodeManager {
     }
 
     // Worker management for decoupled decode → render
-    pub(crate) fn ensure_worker(&mut self, path: &str, ui_ctx: &EguiContext) {
+    pub(crate) fn ensure_worker(
+        &mut self,
+        path: &str,
+        clip_id: Option<&str>,
+        ui_ctx: &EguiContext,
+    ) {
         let key = Self::normalize_path_key(path);
         if self.workers.contains_key(&key) {
+            let clip_str = clip_id
+                .map(|s| s.to_string())
+                .or_else(|| self.worker_clip_ids.get(&key).cloned().flatten())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            info!("[decode] reuse_worker clip={} state=hot", clip_str);
+            if let Some(id) = clip_id {
+                self.worker_clip_ids
+                    .insert(key.clone(), Some(id.to_string()));
+            }
+            if !self.worker_stats.contains_key(&key) {
+                if let Some(rt) = self.workers.get(&key) {
+                    self.worker_stats.insert(key.clone(), Arc::clone(&rt.stats));
+                }
+            }
             return;
         }
-        let rt = spawn_worker(&key, ui_ctx.clone());
+        let clip_owned = clip_id.map(|s| s.to_string());
+        let stats_arc = Arc::new(Mutex::new(WorkerStats::default()));
+        let rt = spawn_worker(
+            &key,
+            clip_owned.clone(),
+            ui_ctx.clone(),
+            Arc::clone(&stats_arc),
+        );
+        info!(
+            "[decode] spawn_worker clip={} reason=playback_start (cold)",
+            clip_owned.as_deref().unwrap_or("<unknown>")
+        );
+        self.worker_clip_ids.insert(key.clone(), clip_owned);
+        self.worker_stats.insert(key.clone(), stats_arc);
+        self.interactive_states.insert(key.clone(), false);
         self.workers.insert(key, rt);
     }
 
@@ -262,6 +303,33 @@ impl DecodeManager {
         if let Some(w) = self.workers.get(&key) {
             let _ = w.cmd_tx.send(cmd);
         }
+    }
+
+    pub(crate) fn set_interactive(&mut self, path: &str, clip_id: Option<&str>, interactive: bool) {
+        let key = Self::normalize_path_key(path);
+        let current = self.interactive_states.get(&key).copied().unwrap_or(false);
+        if current == interactive {
+            return;
+        }
+        if let Some(w) = self.workers.get(&key) {
+            let _ = w.cmd_tx.send(DecodeCmd::SetInteractive {
+                active: interactive,
+            });
+            self.interactive_states.insert(key.clone(), interactive);
+            if let Some(id) = clip_id {
+                self.worker_clip_ids
+                    .insert(key.clone(), Some(id.to_string()));
+            }
+        }
+    }
+
+    pub(crate) fn worker_stats_snapshot(&self, path: &str) -> Option<WorkerStatsSnapshot> {
+        let key = Self::normalize_path_key(path);
+        self.worker_stats.get(&key).and_then(|arc| {
+            arc.lock().ok().map(|stats| WorkerStatsSnapshot {
+                first_frame_ms: stats.first_frame_ms,
+            })
+        })
     }
 
     pub(crate) fn take_latest(&mut self, path: &str) -> Option<VideoFrameOut> {

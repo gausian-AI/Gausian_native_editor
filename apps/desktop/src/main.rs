@@ -1,5 +1,6 @@
-use anyhow::Result;
-use eframe::egui::Widget;
+#![deny(clippy::disallowed_methods)]
+
+use anyhow::{anyhow, Context, Result};
 use eframe::egui_wgpu;
 use eframe::{
     egui::{self, TextureHandle},
@@ -8,7 +9,7 @@ use eframe::{
 use project::{AssetRow, ProjectDb};
 extern crate jobs as jobs_crate;
 extern crate timeline as timeline_crate;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -30,11 +31,20 @@ use decode::{
 use interaction::{DragMode, DragState};
 mod audio_decode;
 mod audio_engine;
+mod cache;
 mod comfyui;
 mod embed_webview;
 mod export;
+mod gpu;
 mod jobs;
+mod media_info;
+mod playback_selector;
 mod preview;
+mod prompt_normalize;
+mod proxy_pipeline;
+mod proxy_policy;
+mod proxy_queue;
+mod screenplay;
 use audio_decode::decode_audio_to_buffer;
 use audio_engine::{ActiveAudioClip, AudioBuffer, AudioEngine};
 pub use export::{ExportCodec, ExportPreset, ExportProgress, ExportUiState};
@@ -97,6 +107,10 @@ fn main() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
+    match native_decoder::describe_platform_decoder() {
+        Ok(desc) => println!("Native decoder selected: {desc}"),
+        Err(err) => println!("Native decoder selection failed: {err}"),
+    }
     // Ensure DB exists before UI
     let data_dir = project::app_data_dir();
     std::fs::create_dir_all(&data_dir).expect("create data dir");
@@ -104,7 +118,7 @@ fn main() {
     let db = ProjectDb::open_or_create(&db_path).expect("open db");
 
     let options = NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_fullscreen(true),
+        viewport: egui::ViewportBuilder::default(),
         ..NativeOptions::default()
     };
     let _ = eframe::run_native(

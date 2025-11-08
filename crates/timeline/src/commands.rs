@@ -40,6 +40,10 @@ pub enum TimelineCommand {
     RemoveTrack {
         track_id: TrackId,
     },
+    MoveTrack {
+        track_id: TrackId,
+        index: usize,
+    },
     AddAutomationLane {
         lane: AutomationLane,
     },
@@ -75,6 +79,7 @@ pub fn apply_command(
         TimelineCommand::RemoveEdge { edge } => remove_edge(graph, edge),
         TimelineCommand::UpsertTrack { track } => upsert_track(graph, track),
         TimelineCommand::RemoveTrack { track_id } => remove_track(graph, track_id),
+        TimelineCommand::MoveTrack { track_id, index } => move_track(graph, track_id, index),
         TimelineCommand::AddAutomationLane { lane } => add_lane(graph, lane),
         TimelineCommand::UpdateAutomationLane { lane } => update_lane(graph, lane),
         TimelineCommand::RemoveAutomationLane { lane_id } => remove_lane(graph, lane_id),
@@ -233,6 +238,25 @@ fn remove_track(
     } else {
         Err(TimelineError::TrackNotFound(track_id))
     }
+}
+
+fn move_track(
+    graph: &mut TimelineGraph,
+    track_id: TrackId,
+    index: usize,
+) -> Result<TimelineCommand, TimelineError> {
+    let current = graph
+        .tracks
+        .iter()
+        .position(|t| t.id == track_id)
+        .ok_or(TimelineError::TrackNotFound(track_id))?;
+    let track = graph.tracks.remove(current);
+    let target = std::cmp::min(index, graph.tracks.len());
+    graph.tracks.insert(target, track);
+    Ok(TimelineCommand::MoveTrack {
+        track_id,
+        index: current,
+    })
 }
 
 fn add_lane(

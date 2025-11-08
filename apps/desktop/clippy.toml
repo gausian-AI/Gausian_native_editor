@@ -1,0 +1,5 @@
+disallowed-methods = [
+    "wgpu::Device::poll",
+    "wgpu::Device::maintain",
+    "wgpu::Device::on_submitted_work_done",
+]

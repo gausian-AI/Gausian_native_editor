@@ -3,6 +3,9 @@ use super::App;
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Moved verbatim from app.rs to reduce file size.
+        while let Ok(ev) = self.screenplay_event_rx.try_recv() {
+            self.screenplay_handle_event(ev);
+        }
         // Drain modal events and append to logs
         while let Ok(ev) = self.modal_rx.try_recv() {
             match ev {
@@ -619,7 +622,7 @@ impl eframe::App for App {
                 ui.heading("Assets");
                 ui.horizontal(|ui| {
                     if ui.button("Import...").clicked() {
-                        if let Some(files) = rfd::FileDialog::new().pick_files() {
+                        if let Some(files) = self.file_dialog().pick_files() {
                             let _ = self.import_files(&files);
                         }
                     }

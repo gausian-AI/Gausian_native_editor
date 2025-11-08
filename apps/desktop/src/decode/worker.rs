@@ -6,10 +6,16 @@ use std::time::Instant;
 use crossbeam_channel as channel;
 use eframe::egui::Context as EguiContext;
 use native_decoder::{create_decoder, DecoderConfig, YuvPixFmt as NativeYuvPixFmt};
+use tracing::{info, trace, warn};
 
 use media_io::YuvPixFmt;
 
 pub(crate) const PREFETCH_BUDGET_PER_TICK: usize = 6;
+
+#[derive(Default)]
+pub(crate) struct WorkerStats {
+    pub first_frame_ms: Option<u64>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlayState {
@@ -51,6 +57,7 @@ pub(crate) enum DecodeCmd {
     Seek { target_pts: f64 },
     Pause,
     Stop,
+    SetInteractive { active: bool },
 }
 
 pub(crate) struct LatestFrameSlot(pub(crate) Arc<Mutex<Option<VideoFrameOut>>>);
@@ -60,14 +67,22 @@ pub(crate) struct DecodeWorkerRuntime {
     pub(crate) handle: thread::JoinHandle<()>,
     pub(crate) cmd_tx: channel::Sender<DecodeCmd>,
     pub(crate) slot: LatestFrameSlot,
+    pub(crate) stats: Arc<Mutex<WorkerStats>>,
 }
 
-pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRuntime {
+pub(crate) fn spawn_worker(
+    path: &str,
+    clip_id: Option<String>,
+    ui_ctx: EguiContext,
+    stats: Arc<Mutex<WorkerStats>>,
+) -> DecodeWorkerRuntime {
     use channel::{unbounded, Receiver, Sender};
     let (cmd_tx, cmd_rx) = unbounded::<DecodeCmd>();
     let slot = LatestFrameSlot(Arc::new(Mutex::new(None)));
     let slot_for_worker = LatestFrameSlot(slot.0.clone());
     let path = path.to_string();
+    let clip_label = clip_id.unwrap_or_else(|| "<unknown>".to_string());
+    let stats_thread = Arc::clone(&stats);
     let handle = thread::spawn(move || {
         // Initialize decoders
         let cfg_cpu = DecoderConfig {
@@ -91,6 +106,9 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
             30.0
         };
         let frame_dur = if fps > 0.0 { 1.0 / fps } else { 1.0 / 30.0 };
+        let original_width = props.width;
+        let original_height = props.height;
+        let codec_fmt = props.format;
 
         let mut mode = PlayState::Paused;
         let mut rate: f32 = 1.0;
@@ -101,6 +119,11 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
         let mut last_seek_target: Option<f64> = None;
         let mut seek_started_at: Option<Instant> = None;
         let mut approx_shown: bool = false;
+        let mut interactive_mode = false;
+        let mut interactive_fullres_warned = false;
+        let mut boot_logged = false;
+        let mut ready_logged = false;
+        let mut boot_start = Instant::now();
 
         let mut pending: VecDeque<VideoFrameOut> = VecDeque::new();
         let mut last_repaint = Instant::now();
@@ -109,6 +132,18 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     DecodeCmd::Play { start_pts, rate: r } => {
+                        if !boot_logged {
+                            boot_start = Instant::now();
+                            ready_logged = false;
+                            if let Ok(mut s) = stats_thread.lock() {
+                                s.first_frame_ms = None;
+                            }
+                            info!(
+                                "[decode] boot clip={} codec={:?} ts={:.3}",
+                                clip_label, codec_fmt, start_pts
+                            );
+                            boot_logged = true;
+                        }
                         let reposition = (anchor_pts - start_pts).abs() > 0.000_001;
                         if reposition {
                             let _ = cpu_dec.seek_to(start_pts);
@@ -140,6 +175,30 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
                                     payload: FramePayload::Cpu { y, uv },
                                     accurate: true,
                                 };
+                                if interactive_mode
+                                    && vf.width == original_width
+                                    && vf.height == original_height
+                                    && !interactive_fullres_warned
+                                {
+                                    warn!(
+                                        "[warn] interactive mode applied but decode still full-res clip={}",
+                                        clip_label
+                                    );
+                                    interactive_fullres_warned = true;
+                                }
+                                if !ready_logged {
+                                    let elapsed_ms = boot_start.elapsed().as_millis();
+                                    info!(
+                                        "[decode] ready clip={} first_frame_ms={}",
+                                        clip_label, elapsed_ms
+                                    );
+                                    if let Ok(mut s) = stats_thread.lock() {
+                                        if s.first_frame_ms.is_none() {
+                                            s.first_frame_ms = Some(elapsed_ms as u64);
+                                        }
+                                    }
+                                    ready_logged = true;
+                                }
                                 if let Ok(mut slot) = slot_for_worker.0.lock() {
                                     *slot = Some(out);
                                 }
@@ -158,6 +217,18 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
                         seek_started_at = None;
                     }
                     DecodeCmd::Seek { target_pts } => {
+                        if !boot_logged {
+                            boot_start = Instant::now();
+                            ready_logged = false;
+                            info!(
+                                "[decode] boot clip={} codec={:?} ts={:.3}",
+                                clip_label, codec_fmt, target_pts
+                            );
+                            boot_logged = true;
+                            if let Ok(mut s) = stats_thread.lock() {
+                                s.first_frame_ms = None;
+                            }
+                        }
                         // Enter seeking; decode exactly once at target_pts, then pause.
                         mode = PlayState::Seeking;
                         anchor_pts = target_pts;
@@ -174,6 +245,19 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
                     }
                     DecodeCmd::Stop => {
                         running = false;
+                    }
+                    DecodeCmd::SetInteractive { active } => {
+                        if interactive_mode != active {
+                            interactive_mode = active;
+                            interactive_fullres_warned = false;
+                            if let Err(err) = cpu_dec.set_interactive(active) {
+                                warn!("decode worker failed to toggle interactive mode: {}", err);
+                            }
+                            info!(
+                                "[interactive] apply clip={} interactive={}",
+                                clip_label, active
+                            );
+                        }
                     }
                 }
             }
@@ -208,7 +292,26 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
                             payload: FramePayload::Cpu { y, uv },
                             accurate: true,
                         };
-                        eprintln!("[WORKER] out pts={:.3}", out.pts);
+                        if interactive_mode
+                            && vf.width == original_width
+                            && vf.height == original_height
+                            && !interactive_fullres_warned
+                        {
+                            warn!(
+                                "[warn] interactive mode applied but decode still full-res clip={}",
+                                clip_label
+                            );
+                            interactive_fullres_warned = true;
+                        }
+                        if !ready_logged {
+                            let elapsed_ms = boot_start.elapsed().as_millis();
+                            info!(
+                                "[decode] ready clip={} first_frame_ms={}",
+                                clip_label, elapsed_ms
+                            );
+                            ready_logged = true;
+                        }
+                        tracing::trace!(pts = out.pts, "decode worker emitted frame");
                         if let Ok(mut g) = slot_for_worker.0.lock() {
                             *g = Some(out);
                         }
@@ -263,7 +366,31 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
                                 payload: FramePayload::Cpu { y, uv },
                                 accurate: approx_shown, // first stage false, refine (second) true
                             };
-                            eprintln!("[WORKER] out pts={:.3}", out.pts);
+                            if interactive_mode
+                                && vf.width == original_width
+                                && vf.height == original_height
+                                && !interactive_fullres_warned
+                            {
+                                warn!(
+                                    "[warn] interactive mode applied but decode still full-res clip={}",
+                                    clip_label
+                                );
+                                interactive_fullres_warned = true;
+                            }
+                            if !ready_logged {
+                                let elapsed_ms = boot_start.elapsed().as_millis();
+                                info!(
+                                    "[decode] ready clip={} first_frame_ms={}",
+                                    clip_label, elapsed_ms
+                                );
+                                if let Ok(mut s) = stats_thread.lock() {
+                                    if s.first_frame_ms.is_none() {
+                                        s.first_frame_ms = Some(elapsed_ms as u64);
+                                    }
+                                }
+                                ready_logged = true;
+                            }
+                            tracing::trace!(pts = out.pts, "decode worker emitted frame");
                             if let Ok(mut g) = slot_for_worker.0.lock() {
                                 *g = Some(out);
                             }
@@ -314,5 +441,6 @@ pub(crate) fn spawn_worker(path: &str, ui_ctx: EguiContext) -> DecodeWorkerRunti
         handle,
         cmd_tx,
         slot,
+        stats,
     }
 }

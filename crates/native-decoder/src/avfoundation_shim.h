@@ -31,6 +31,7 @@ double avfoundation_peek_first_sample_pts(AVFoundationContext* ctx);
 void  avfoundation_release_context(AVFoundationContext* ctx);
 /* existing */
 const void* avfoundation_create_destination_attributes(void);
+const void* avfoundation_create_destination_attributes_scaled(int width, int height);
 
 // Install a global handler that logs any uncaught NSException (name, reason, callstack)
 void avf_install_uncaught_exception_handler(void);

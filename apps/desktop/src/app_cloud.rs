@@ -1,5 +1,6 @@
 use crossbeam_channel::Sender;
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 
 use super::App;
 
@@ -49,19 +50,16 @@ pub(super) fn modal_test_connection(app: &App) {
                                 for (i, j) in arr.iter().enumerate().take(3) {
                                     let jid = j.get("id").and_then(|s| s.as_str()).unwrap_or("");
                                     let st = j.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                                    if let Some(arts) = j
-                                        .get("artifacts")
-                                        .and_then(|a| a.as_array())
+                                    if let Some(arts) =
+                                        j.get("artifacts").and_then(|a| a.as_array())
                                     {
                                         for (k, a) in arts.iter().enumerate().take(2) {
                                             let fname = a
                                                 .get("filename")
                                                 .and_then(|s| s.as_str())
                                                 .unwrap_or("");
-                                            let url = a
-                                                .get("url")
-                                                .and_then(|s| s.as_str())
-                                                .unwrap_or("");
+                                            let url =
+                                                a.get("url").and_then(|s| s.as_str()).unwrap_or("");
                                             log(&format!(
                                                 "  [{}] {} {} -> {}",
                                                 i + 1,
@@ -74,12 +72,7 @@ pub(super) fn modal_test_connection(app: &App) {
                                             }
                                         }
                                     } else {
-                                        log(&format!(
-                                            "  [{}] {} (status: {})",
-                                            i + 1,
-                                            jid,
-                                            st
-                                        ));
+                                        log(&format!("  [{}] {} (status: {})", i + 1, jid, st));
                                     }
                                 }
                             }
@@ -243,15 +236,13 @@ pub(super) fn modal_queue_job(app: &App) {
                                     // Also include the unique prefix used for this run (preserved base + client_id)
                                     // Try to extract what we actually set for filename_prefix
                                     let mut prefix_used = client_id.clone();
-                                    if let Some(prompt_obj) = body_v
-                                        .get("prompt")
-                                        .and_then(|p| p.as_object())
+                                    if let Some(prompt_obj) =
+                                        body_v.get("prompt").and_then(|p| p.as_object())
                                     {
                                         for node_v in prompt_obj.values() {
                                             if let Some(nobj) = node_v.as_object() {
-                                                if let Some(inputs) = nobj
-                                                    .get("inputs")
-                                                    .and_then(|i| i.as_object())
+                                                if let Some(inputs) =
+                                                    nobj.get("inputs").and_then(|i| i.as_object())
                                                 {
                                                     if let Some(fpv) = inputs
                                                         .get("filename_prefix")
@@ -330,17 +321,19 @@ pub(super) fn compute_phase_plan_from_payload(payload: &str) -> super::PhasePlan
             if let Some(arr) = v.get("nodes").and_then(|n| n.as_array()) {
                 let mut tmp = serde_json::Map::new();
                 for n in arr {
-                    if let (Some(id), Some(ct)) = (
-                        n.get("id"),
-                        n.get("class_type").and_then(|s| s.as_str()),
-                    ) {
+                    if let (Some(id), Some(ct)) =
+                        (n.get("id"), n.get("class_type").and_then(|s| s.as_str()))
+                    {
                         let id_s = if let Some(i) = id.as_i64() {
                             i.to_string()
                         } else {
                             id.as_str().unwrap_or("").to_string()
                         };
                         let mut o = serde_json::Map::new();
-                        o.insert("class_type".into(), serde_json::Value::String(ct.to_string()));
+                        o.insert(
+                            "class_type".into(),
+                            serde_json::Value::String(ct.to_string()),
+                        );
                         tmp.insert(id_s, serde_json::Value::Object(o));
                     }
                 }
@@ -456,11 +449,7 @@ pub(super) fn modal_refresh_recent(app: &App) {
     });
 }
 
-pub(super) fn modal_import_url(
-    app: &App,
-    url: String,
-    suggested_name: Option<String>,
-) {
+pub(super) fn modal_import_url(app: &App, url: String, suggested_name: Option<String>) {
     let token = app.modal_api_key.clone();
     let tx_import = app.comfy_ingest_tx.clone();
     let proj_id = app.project_id.clone();
@@ -480,13 +469,11 @@ pub(super) fn modal_import_url(
                     .filter(|s| !s.is_empty())
                     .or_else(|| {
                         // derive from URL path
-                        url::Url::parse(&url)
-                            .ok()
-                            .and_then(|u| {
-                                u.path_segments()
-                                    .and_then(|mut p| p.next_back())
-                                    .map(|s| s.to_string())
-                            })
+                        url::Url::parse(&url).ok().and_then(|u| {
+                            u.path_segments()
+                                .and_then(|mut p| p.next_back())
+                                .map(|s| s.to_string())
+                        })
                     })
                     .unwrap_or_else(|| "artifact.mp4".to_string());
                 let tmpdir = project::app_data_dir().join("tmp").join("cloud");
@@ -500,7 +487,10 @@ pub(super) fn modal_import_url(
                             return;
                         }
                         let _ = tx_import.send((proj_id.clone(), tmp.clone()));
-                        log(&format!("Downloaded → queued import: {}", tmp.to_string_lossy()));
+                        log(&format!(
+                            "Downloaded → queued import: {}",
+                            tmp.to_string_lossy()
+                        ));
                     }
                     Err(e) => {
                         log(&format!("Temp create failed: {}", e));
@@ -517,20 +507,231 @@ pub(super) fn modal_import_url(
 // build a minimal prompt map with class_type and any provided literal inputs.
 // Complex graph links are not guaranteed to convert; if conversion isn't possible,
 // returns an Err with a helpful message.
+fn is_ui_only_node(
+    class_type: Option<&str>,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    if let Some(class) = class_type.map(str::trim) {
+        let lower = class.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "markdownnote" | "markdown_note" | "markdown note" | "note"
+        ) {
+            return true;
+        }
+    }
+    if let Some(meta) = meta {
+        if let Some(category) = meta.get("category").and_then(|s| s.as_str()) {
+            if category.eq_ignore_ascii_case("ui") {
+                return true;
+            }
+        }
+        if meta
+            .get("ui_only")
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub(super) fn strip_ui_only_prompt_nodes(prompt: &mut serde_json::Map<String, serde_json::Value>) {
+    let to_remove: Vec<String> = prompt
+        .iter()
+        .filter_map(|(id, node)| {
+            let obj = node.as_object()?;
+            if is_ui_only_node(
+                obj.get("class_type").and_then(|v| v.as_str()),
+                obj.get("_meta").and_then(|m| m.as_object()),
+            ) {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for key in to_remove {
+        prompt.remove(&key);
+    }
+}
+
+fn widget_value(values: &[serde_json::Value], idx: usize) -> Option<serde_json::Value> {
+    values.get(idx).cloned().filter(|v| !v.is_null())
+}
+
+fn node_widget_inputs(
+    class_type: &str,
+    widgets: &serde_json::Value,
+) -> Vec<(String, serde_json::Value)> {
+    let mut pairs = Vec::new();
+    if let Some(map) = widgets.as_object() {
+        for (key, value) in map {
+            if value.is_null() || value.is_object() {
+                continue;
+            }
+            pairs.push((key.clone(), value.clone()));
+        }
+        return pairs;
+    }
+    let Some(values) = widgets.as_array() else {
+        return pairs;
+    };
+    match class_type {
+        "SaveVideo" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("filename_prefix".into(), v));
+            }
+            if let Some(v) = widget_value(values, 1) {
+                pairs.push(("format".into(), v));
+            }
+            if let Some(v) = widget_value(values, 2) {
+                pairs.push(("codec".into(), v));
+            }
+        }
+        "SaveImage" | "ImageSave" | "SaveImageBuiltin" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("filename_prefix".into(), v));
+            }
+        }
+        "CreateVideo" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("fps".into(), v));
+            }
+        }
+        "WanImageToVideo" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("width".into(), v));
+            }
+            if let Some(v) = widget_value(values, 1) {
+                pairs.push(("height".into(), v));
+            }
+            if let Some(v) = widget_value(values, 2) {
+                pairs.push(("length".into(), v));
+            }
+            if let Some(v) = widget_value(values, 3) {
+                pairs.push(("batch_size".into(), v));
+            }
+        }
+        "Wan22ImageToVideoLatent" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("width".into(), v));
+            }
+            if let Some(v) = widget_value(values, 1) {
+                pairs.push(("height".into(), v));
+            }
+            if let Some(v) = widget_value(values, 2) {
+                pairs.push(("length".into(), v));
+            }
+            if let Some(v) = widget_value(values, 3) {
+                pairs.push(("batch_size".into(), v));
+            }
+        }
+        "ModelSamplingSD3" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("shift".into(), v));
+            }
+        }
+        "UNETLoader" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("unet_name".into(), v));
+            }
+            if let Some(v) = widget_value(values, 1) {
+                pairs.push(("weight_dtype".into(), v));
+            }
+        }
+        "LoraLoaderModelOnly" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("lora_name".into(), v));
+            }
+            if let Some(v) = widget_value(values, 1) {
+                pairs.push(("strength_model".into(), v));
+            }
+        }
+        "CLIPLoader" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("clip_name".into(), v));
+            }
+            if let Some(v) = widget_value(values, 1) {
+                pairs.push(("type".into(), v));
+            }
+            if let Some(v) = widget_value(values, 2) {
+                pairs.push(("device".into(), v));
+            }
+        }
+        "CLIPTextEncode" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("text".into(), v));
+            }
+            if let Some(v) = widget_value(values, 1) {
+                pairs.push(("clip_skip".into(), v));
+            }
+        }
+        "VAELoader" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("vae_name".into(), v));
+            }
+        }
+        "LoadImage" => {
+            if let Some(v) = widget_value(values, 0) {
+                pairs.push(("image".into(), v));
+            }
+        }
+        "KSamplerAdvanced" => {
+            let keys = [
+                "add_noise",
+                "noise_seed",
+                "noise_seed_behavior",
+                "steps",
+                "cfg",
+                "sampler_name",
+                "scheduler",
+                "start_at_step",
+                "end_at_step",
+                "return_with_leftover_noise",
+            ];
+            for (idx, key) in keys.iter().enumerate() {
+                if let Some(v) = widget_value(values, idx) {
+                    pairs.push((key.to_string(), v));
+                }
+            }
+        }
+        "KSampler" => {
+            let keys = [
+                "seed",
+                "steps",
+                "cfg",
+                "sampler_name",
+                "scheduler",
+                "denoise",
+            ];
+            for (idx, key) in keys.iter().enumerate() {
+                if let Some(v) = widget_value(values, idx) {
+                    pairs.push((key.to_string(), v));
+                }
+            }
+        }
+        _ => {}
+    }
+    pairs
+}
+
 pub(super) fn convert_workflow_to_prompt(workflow_json: &str) -> Result<String, String> {
-    let v: serde_json::Value = serde_json::from_str(workflow_json)
-        .map_err(|e| format!("Invalid JSON: {}", e))?;
-    if v.get("prompt").is_some() {
-        // Already a prompt payload
+    let mut v: serde_json::Value =
+        serde_json::from_str(workflow_json).map_err(|e| format!("Invalid JSON: {}", e))?;
+    if let Some(prompt) = v.get_mut("prompt").and_then(|p| p.as_object_mut()) {
+        strip_ui_only_prompt_nodes(prompt);
         return Ok(v.to_string());
     }
     // If it's already a node-id keyed object with class_type, wrap as prompt
-    if v.is_object() {
-        let obj = v.as_object().unwrap();
+    if let Some(obj) = v.as_object() {
         let looks_like_prompt = obj.values().all(|n| n.get("class_type").is_some());
         if looks_like_prompt {
+            let mut prompt = obj.clone();
+            strip_ui_only_prompt_nodes(&mut prompt);
             let mut wrap = serde_json::Map::new();
-            wrap.insert("prompt".into(), serde_json::Value::Object(obj.clone()));
+            wrap.insert("prompt".into(), serde_json::Value::Object(prompt));
             wrap.insert(
                 "client_id".into(),
                 serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
@@ -542,10 +743,25 @@ pub(super) fn convert_workflow_to_prompt(workflow_json: &str) -> Result<String, 
     let nodes = v.get("nodes").and_then(|n| n.as_array()).ok_or_else(|| {
         "Workflow JSON doesn't contain a 'prompt' or a 'nodes' array; please paste a ComfyUI API prompt (Copy API)".to_string()
     })?;
+    let mut link_map: HashMap<i64, (String, i64)> = HashMap::new();
+    if let Some(links) = v.get("links").and_then(|l| l.as_array()) {
+        for link in links {
+            if let Some(arr) = link.as_array() {
+                if let (Some(id), Some(src_node), Some(src_slot)) = (
+                    arr.get(0).and_then(|v| v.as_i64()),
+                    arr.get(1).and_then(|v| v.as_i64()),
+                    arr.get(2).and_then(|v| v.as_i64()),
+                ) {
+                    link_map.insert(id, (src_node.to_string(), src_slot));
+                }
+            }
+        }
+    }
     let mut prompt = serde_json::Map::new();
-    for node in nodes.iter() {
-        // id as string key
-        let id_val = node.get("id").ok_or_else(|| "Node missing 'id'".to_string())?;
+    for node in nodes {
+        let id_val = node
+            .get("id")
+            .ok_or_else(|| "Node missing 'id'".to_string())?;
         let id_str = if let Some(n) = id_val.as_i64() {
             n.to_string()
         } else {
@@ -554,27 +770,79 @@ pub(super) fn convert_workflow_to_prompt(workflow_json: &str) -> Result<String, 
         if id_str.is_empty() {
             return Err("Node id is empty".into());
         }
-        // class type heuristic
         let class_type = node
             .get("class_type")
             .or_else(|| node.get("type"))
             .or_else(|| node.get("class"))
             .and_then(|s| s.as_str())
             .ok_or_else(|| format!("Node {} missing class_type", id_str))?;
-        // inputs: try 'inputs' object if present; otherwise empty
-        let inputs = node
-            .get("inputs")
-            .and_then(|i| i.as_object())
-            .cloned()
-            .unwrap_or_default();
+        if is_ui_only_node(
+            Some(class_type),
+            node.get("_meta").and_then(|m| m.as_object()),
+        ) {
+            continue;
+        }
+        let mut inputs_map = serde_json::Map::new();
+        if let Some(inputs_arr) = node.get("inputs").and_then(|i| i.as_array()) {
+            for input in inputs_arr {
+                if let Some(name) = input.get("name").and_then(|n| n.as_str()) {
+                    if let Some(link_id) = input.get("link").and_then(|l| l.as_i64()) {
+                        if let Some((src_id, src_slot)) = link_map.get(&link_id) {
+                            inputs_map.insert(
+                                name.to_string(),
+                                serde_json::Value::Array(vec![
+                                    serde_json::Value::String(src_id.clone()),
+                                    serde_json::Value::Number(serde_json::Number::from(*src_slot)),
+                                ]),
+                            );
+                        }
+                    } else if let Some(value) = input.get("value").cloned() {
+                        inputs_map.insert(name.to_string(), value);
+                    }
+                }
+            }
+        }
+        if let Some(widgets) = node.get("widgets_values") {
+            for (key, value) in node_widget_inputs(class_type, widgets) {
+                inputs_map.entry(key).or_insert(value);
+            }
+        }
         let mut nobj = serde_json::Map::new();
         nobj.insert(
             "class_type".into(),
             serde_json::Value::String(class_type.to_string()),
         );
-        nobj.insert("inputs".into(), serde_json::Value::Object(inputs));
+        nobj.insert("inputs".into(), serde_json::Value::Object(inputs_map));
+        let mut meta_map = node
+            .get("_meta")
+            .and_then(|m| m.as_object())
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new);
+        let title_from_meta = meta_map
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let title_from_node = node
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        if let Some(title) = title_from_node.clone() {
+            meta_map.insert("title".into(), serde_json::Value::String(title.clone()));
+        }
+        let effective_title = title_from_node.or(title_from_meta);
+        if let Some(title) = effective_title {
+            nobj.insert("title".into(), serde_json::Value::String(title));
+        }
+        if !meta_map.is_empty() {
+            nobj.insert("_meta".into(), serde_json::Value::Object(meta_map));
+        }
         prompt.insert(id_str, serde_json::Value::Object(nobj));
     }
+    strip_ui_only_prompt_nodes(&mut prompt);
     let mut root = serde_json::Map::new();
     root.insert("prompt".into(), serde_json::Value::Object(prompt));
     root.insert(

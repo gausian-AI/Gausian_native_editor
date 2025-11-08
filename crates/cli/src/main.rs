@@ -238,6 +238,13 @@ async fn import_command(
                     fps_den,
                     info.audio_channels.map(|x| x as i64),
                     info.sample_rate.map(|x| x as i64),
+                    info.duration_seconds,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
                 )?;
 
                 info!("Imported {} as asset ID: {}", kind, asset_id);

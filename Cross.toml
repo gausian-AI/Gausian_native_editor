@@ -1,0 +1,8 @@
+[target.x86_64-unknown-linux-gnu]
+image = "cross-custom-gausian:x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu.commands]
+bundle = [
+  "cargo install cargo-bundle",
+  "cargo bundle --release --target x86_64-unknown-linux-gnu"
+]

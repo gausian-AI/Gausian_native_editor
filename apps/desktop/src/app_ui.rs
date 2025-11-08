@@ -1,11 +1,21 @@
-use super::App;
+use super::{App, AutoProxySetting, ComfyAlertKind, ViewerScale, WorkspaceView};
+use crate::playback_selector::ProxyMode;
+use crate::proxy_queue::{ProxyReason, ProxyStatus};
+use chrono::{Local, TimeZone};
+use egui::{ComboBox, RichText, ScrollArea};
+use project::AssetRow;
 use std::path::Path;
 
 const EMBED_WEBVIEW_SUPPORTED: bool = cfg!(all(target_os = "macos", feature = "embed-webview"));
 
 pub(super) fn top_toolbar(app: &mut App, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-    // Keep engine.state aligned with the clock unless we're in an explicit drag/seek
-    if !matches!(app.engine.state, super::decode::PlayState::Scrubbing | super::decode::PlayState::Seeking) {
+    if !matches!(app.mode, super::AppMode::Editor) {
+        return;
+    }
+    if !matches!(
+        app.engine.state,
+        super::decode::PlayState::Scrubbing | super::decode::PlayState::Seeking
+    ) {
         app.engine.state = if app.playback_clock.playing {
             super::decode::PlayState::Playing
         } else {
@@ -13,61 +23,154 @@ pub(super) fn top_toolbar(app: &mut App, ctx: &egui::Context, _frame: &mut efram
         };
     }
     egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        app.prune_comfy_alerts();
+        let mut dismiss_alert = false;
+        if let Some((message, kind)) = app
+            .comfy_alerts
+            .front()
+            .map(|alert| (alert.message.clone(), alert.kind))
+        {
+            let (bg, fg) = match kind {
+                ComfyAlertKind::Info => (
+                    egui::Color32::from_rgb(32, 70, 130),
+                    egui::Color32::from_rgb(220, 235, 255),
+                ),
+                ComfyAlertKind::Success => (
+                    egui::Color32::from_rgb(24, 90, 48),
+                    egui::Color32::from_rgb(220, 246, 224),
+                ),
+                ComfyAlertKind::Warning => (
+                    egui::Color32::from_rgb(120, 32, 32),
+                    egui::Color32::from_rgb(255, 228, 228),
+                ),
+            };
+            egui::Frame::none()
+                .fill(bg)
+                .stroke(egui::Stroke::new(1.0, fg))
+                .rounding(egui::Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(message).color(fg).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Dismiss").clicked() {
+                                dismiss_alert = true;
+                            }
+                        });
+                    });
+                });
+        }
+        if dismiss_alert {
+            app.comfy_alerts.pop_front();
+        }
+        let job_summary = app.job_status_summary();
         ui.horizontal(|ui| {
-            ui.label("Import path:");
-            ui.text_edit_singleline(&mut app.import_path);
-            if ui.button("Add").clicked() {
-                app.import_from_path();
-            }
-            if ui.button("Export...").clicked() {
-                app.export_sequence();
-            }
-            if ui.button("Back to Projects").clicked() {
-                let _ = app.save_project_timeline();
-                app.mode = super::AppMode::ProjectPicker;
-                if let Some(mut host) = app.comfy_webview.take() {
-                    host.close();
-                }
-            }
-            if ui.button("Jobs").clicked() {
-                app.show_jobs = !app.show_jobs;
-            }
-            if ui.button("Settings").clicked() {
-                app.show_settings = !app.show_settings;
+            ui.label("Workspace:");
+            let mut workspace = app.workspace_view;
+            ui.selectable_value(&mut workspace, WorkspaceView::Timeline, "Timeline");
+            ui.selectable_value(&mut workspace, WorkspaceView::Chat, "Screenplay");
+            ui.selectable_value(&mut workspace, WorkspaceView::Storyboard, "Storyboard");
+            if workspace != app.workspace_view {
+                app.switch_workspace(workspace);
             }
             ui.separator();
-            if ui
-                .button(if app.engine.state == super::decode::PlayState::Playing {
-                    "Pause (Space)"
-                } else {
-                    "Play (Space)"
-                })
-                .clicked()
-            {
-                let seq_fps = (app.seq.fps.num.max(1) as f64)
-                    / (app.seq.fps.den.max(1) as f64);
-                let current_sec = (app.playhead as f64) / seq_fps;
-                if app.engine.state == super::decode::PlayState::Playing {
-                    app.playback_clock.pause(current_sec);
-                    app.engine.state = super::decode::PlayState::Paused;
-                    if let Some(engine) = &app.audio_out {
-                        engine.pause(current_sec);
-                    }
-                } else {
-                    app.playback_clock.play(current_sec);
-                    app.engine.state = super::decode::PlayState::Playing;
-                    if let Ok(clips) = app.build_audio_clips() {
-                        if let Some(engine) = &app.audio_out {
-                            engine.start(current_sec, clips);
+            match app.workspace_view {
+                WorkspaceView::Timeline => timeline_toolbar(app, ui),
+                WorkspaceView::Chat => super::app_screenplay::chat_toolbar(app, ui),
+                WorkspaceView::Storyboard => super::app_storyboard::storyboard_toolbar(app, ui),
+            }
+            let job_summary = job_summary.clone();
+            let right_width = ui.available_width().max(0.0);
+            if right_width > 0.0 {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(right_width, 0.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let queued_text = format!("Jobs: {}", job_summary.queued);
+                        let label = egui::Label::new(RichText::new(queued_text).strong())
+                            .sense(egui::Sense::click());
+                        let response = ui.add(label).on_hover_text(format!(
+                            "Pending: {}\nRunning: {}",
+                            job_summary.pending, job_summary.running
+                        ));
+                        if response.clicked() {
+                            app.show_jobs = true;
                         }
-                    }
-                }
+
+                        if let Some(progress) = job_summary.progress {
+                            let progress_value = progress.value.clamp(0.0, 1.0);
+                            let progress_text = progress.label.clone();
+                            ui.add(
+                                egui::ProgressBar::new(progress_value)
+                                    .desired_width(140.0)
+                                    .show_percentage()
+                                    .text(progress_text),
+                            );
+                        } else if job_summary.running > 0 {
+                            ui.label(format!("Running: {}", job_summary.running));
+                        } else if job_summary.pending > 0 {
+                            ui.label(format!("Pending: {}", job_summary.pending));
+                        }
+                    },
+                );
             }
         });
     });
 }
 
+fn timeline_toolbar(app: &mut App, ui: &mut egui::Ui) {
+    ui.label("Import path:");
+    ui.text_edit_singleline(&mut app.import_path);
+    if ui.button("Add").clicked() {
+        app.import_from_path();
+    }
+    if ui.button("Export...").clicked() {
+        app.export_sequence();
+    }
+    if ui.button("Back to Projects").clicked() {
+        let _ = app.save_project_timeline();
+        app.mode = super::AppMode::ProjectPicker;
+        if let Some(mut host) = app.comfy_webview.take() {
+            host.close();
+        }
+    }
+    if ui.button("Jobs").clicked() {
+        app.show_jobs = !app.show_jobs;
+    }
+    if ui.button("Settings").clicked() {
+        app.show_settings = !app.show_settings;
+    }
+    ui.separator();
+    if ui
+        .button(if app.engine.state == super::decode::PlayState::Playing {
+            "Pause (Space)"
+        } else {
+            "Play (Space)"
+        })
+        .clicked()
+    {
+        let seq_fps = (app.seq.fps.num.max(1) as f64) / (app.seq.fps.den.max(1) as f64);
+        let current_sec = (app.playhead as f64) / seq_fps;
+        if app.engine.state == super::decode::PlayState::Playing {
+            app.playback_clock.pause(current_sec);
+            app.engine.state = super::decode::PlayState::Paused;
+            if let Some(engine) = &app.audio_out {
+                engine.pause(current_sec);
+            }
+        } else {
+            app.playback_clock.play(current_sec);
+            app.engine.state = super::decode::PlayState::Playing;
+            if let Ok(clips) = app.build_audio_clips() {
+                if let Some(engine) = &app.audio_out {
+                    engine.start(current_sec, clips);
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn preview_settings_window(app: &mut App, ctx: &egui::Context) {
+    let mut persist_settings = false;
     egui::Window::new("Preview Settings")
         .open(&mut app.show_settings)
         .resizable(false)
@@ -95,7 +198,73 @@ pub(super) fn preview_settings_window(app: &mut App, ctx: &egui::Context) {
                 .text("Clear threshold on seek (frames)"),
             );
             ui.small("Higher tolerance = more off-target frames accepted. Higher clear threshold = fewer blanks on small nudges.");
+
+            ui.separator();
+            ui.label("Media playback mode:");
+            let mut user_mode = app.proxy_mode_user;
+            ComboBox::from_id_source("proxy_mode_combo")
+                .selected_text(user_mode.display_name())
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        ProxyMode::OriginalOptimized,
+                        ProxyMode::ProxyPreferred,
+                        ProxyMode::ProxyOnly,
+                    ] {
+                        ui.selectable_value(&mut user_mode, mode, mode.display_name());
+                    }
+                });
+            if user_mode != app.proxy_mode_user {
+                app.proxy_mode_user = user_mode;
+                app.proxy_mode_override = None;
+                persist_settings = true;
+            }
+            if let Some(override_mode) = app.proxy_mode_override {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!(
+                        "Auto override active ({}).",
+                        override_mode.display_name()
+                    ))
+                    .italics());
+                    if ui.small_button("Clear override").clicked() {
+                        app.proxy_mode_override = None;
+                    }
+                });
+            }
+
+            ui.separator();
+            ui.label("Auto proxies:");
+            let mut auto_pref = app.auto_proxy_setting;
+            ComboBox::from_id_source("auto_proxy_combo")
+                .selected_text(auto_pref.display_name())
+                .show_ui(ui, |ui| {
+                    for pref in [
+                        AutoProxySetting::Off,
+                        AutoProxySetting::LargeOnly,
+                        AutoProxySetting::All,
+                    ] {
+                        ui.selectable_value(&mut auto_pref, pref, pref.display_name());
+                    }
+                });
+            if auto_pref != app.auto_proxy_setting {
+                app.auto_proxy_setting = auto_pref;
+                persist_settings = true;
+            }
+
+            ui.separator();
+            ui.label(format!("Viewer scale: {}", app.viewer_scale.label()));
+            if app.viewer_scale != ViewerScale::Full {
+                if ui.small_button("Reset viewer scale").clicked() {
+                    app.viewer_scale = ViewerScale::Full;
+                    app.playback_lag_frames = 0;
+                    app.playback_stable_frames = 0;
+                }
+            }
         });
+    if persist_settings {
+        if let Err(err) = app.persist_proxy_settings() {
+            eprintln!("Failed to persist proxy settings: {err}");
+        }
+    }
 }
 
 pub(super) fn show_project_picker_if_needed(app: &mut App, ctx: &egui::Context) -> bool {
@@ -138,10 +307,7 @@ pub(super) fn show_project_picker_if_needed(app: &mut App, ctx: &egui::Context) 
                                                 color,
                                                 egui::TextureOptions::LINEAR,
                                             );
-                                            app.asset_thumb_textures.insert(
-                                                tex_key.clone(),
-                                                tex,
-                                            );
+                                            app.asset_thumb_textures.insert(tex_key.clone(), tex);
                                             break;
                                         }
                                     }
@@ -156,10 +322,8 @@ pub(super) fn show_project_picker_if_needed(app: &mut App, ctx: &egui::Context) 
                             let scale = (rw / tw).min(rh / th);
                             let dw = (tw * scale).max(1.0);
                             let dh = (th * scale).max(1.0);
-                            let img_rect = egui::Rect::from_center_size(
-                                r.center(),
-                                egui::vec2(dw, dh),
-                            );
+                            let img_rect =
+                                egui::Rect::from_center_size(r.center(), egui::vec2(dw, dh));
                             let uv = egui::Rect::from_min_max(
                                 egui::pos2(0.0, 0.0),
                                 egui::pos2(1.0, 1.0),
@@ -192,13 +356,35 @@ pub(super) fn show_project_picker_if_needed(app: &mut App, ctx: &egui::Context) 
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new(&p.name).strong());
                         ui.add_space(4.0);
-                        if ui.button("Open").clicked() {
-                            app.project_id = p.id.clone();
-                            app.selected = None;
-                            app.drag = None;
-                            app.load_project_timeline();
-                            app.mode = super::AppMode::Editor;
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Open").clicked() {
+                                app.project_id = p.id.clone();
+                                app.selected = None;
+                                app.drag = None;
+                                app.load_project_timeline();
+                                app.mode = super::AppMode::Editor;
+                            }
+
+                            let delete_btn = egui::Button::new(
+                                egui::RichText::new("Delete")
+                                    .color(egui::Color32::from_rgb(210, 64, 64)),
+                            );
+                            if ui
+                                .add(delete_btn)
+                                .on_hover_text("Delete project and remove associated proxies")
+                                .clicked()
+                            {
+                                if let Err(err) = app.delete_project_and_cleanup(&p.id) {
+                                    tracing::error!(
+                                        project_id = %p.id,
+                                        error = %err,
+                                        "failed to delete project"
+                                    );
+                                } else {
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        });
                     });
                     ui.add_space(8.0);
                 }
@@ -219,9 +405,7 @@ pub(super) fn show_project_picker_if_needed(app: &mut App, ctx: &egui::Context) 
             {
                 let id = uuid::Uuid::new_v4().to_string();
                 let safe_name = app.new_project_name.trim();
-                let mut base = project::app_data_dir()
-                    .join("projects")
-                    .join(safe_name);
+                let mut base = project::app_data_dir().join("projects").join(safe_name);
                 let mut i = 1;
                 while base.exists() {
                     base = project::app_data_dir()
@@ -253,7 +437,7 @@ pub(super) fn assets_panel(app: &mut App, ctx: &egui::Context) {
             ui.heading("Assets");
             ui.horizontal(|ui| {
                 if ui.button("Import...").clicked() {
-                    if let Some(files) = rfd::FileDialog::new().pick_files() {
+                    if let Some(files) = app.file_dialog().pick_files() {
                         let _ = app.import_files(&files);
                     }
                 }
@@ -265,6 +449,8 @@ pub(super) fn assets_panel(app: &mut App, ctx: &egui::Context) {
                     app.show_comfy_panel = !app.show_comfy_panel;
                 }
             });
+            let assets = app.assets();
+            proxy_jobs_summary(app, ui, &assets);
             if app.show_comfy_panel {
                 comfy_settings_panel(app, ui);
             }
@@ -273,8 +459,63 @@ pub(super) fn assets_panel(app: &mut App, ctx: &egui::Context) {
             // Embedded ComfyUI panel at top of assets (outside scrolling region)
             comfy_embed_in_assets(app, ui);
             // Remaining scrollable section (native decoder tests, etc.)
-            assets_scroll_section(app, ui);
+            assets_scroll_section(app, ui, &assets);
         });
+}
+
+pub(super) fn proxy_jobs_summary(app: &mut App, ui: &mut egui::Ui, assets: &[AssetRow]) {
+    let mut active: Vec<(String, ProxyStatus)> = app
+        .proxy_status
+        .iter()
+        .filter_map(|(asset_id, status)| match status {
+            ProxyStatus::Pending | ProxyStatus::Running { .. } => {
+                Some((asset_id.clone(), status.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if active.is_empty() {
+        return;
+    }
+    active.sort_by(|a, b| a.0.cmp(&b.0));
+
+    ui.add_space(6.0);
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Proxy Jobs").strong());
+            ui.label(format!("Active: {}", active.len()));
+        });
+        ui.add_space(4.0);
+        for (asset_id, status) in active {
+            let name = assets
+                .iter()
+                .find(|asset| asset.id == asset_id)
+                .map(asset_display_name)
+                .unwrap_or_else(|| asset_id.clone());
+            ui.label(RichText::new(name).small());
+            match status {
+                ProxyStatus::Pending => {
+                    ui.add(
+                        egui::ProgressBar::new(0.0)
+                            .desired_width(ui.available_width())
+                            .text("Waiting to start…"),
+                    );
+                }
+                ProxyStatus::Running { progress } => {
+                    let pct = progress.clamp(0.0, 1.0);
+                    ui.add(
+                        egui::ProgressBar::new(pct)
+                            .desired_width(ui.available_width())
+                            .show_percentage()
+                            .text(format!("Encoding {:.0}%", pct * 100.0)),
+                    );
+                }
+                _ => {}
+            }
+            ui.add_space(4.0);
+        }
+    });
+    ui.add_space(6.0);
 }
 
 pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
@@ -308,7 +549,8 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
                 if let Some(mut host) = app.comfy_webview.take() {
                     host.close();
                 }
-                app.comfy_embed_logs.push_back("Embedded view closed".into());
+                app.comfy_embed_logs
+                    .push_back("Embedded view closed".into());
             }
         }
         if !EMBED_WEBVIEW_SUPPORTED {
@@ -321,34 +563,14 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
                     app.comfy_embed_logs.push_back("Reload requested".into());
                 }
             }
-            let mut dt = app.comfy_devtools;
-            if ui.checkbox(&mut dt, "DevTools").on_hover_text("Enable WebKit developer extras; right-click → Inspect").changed()
-            {
-                app.comfy_devtools = dt;
-                if let Some(h) = app.comfy_webview.as_mut() {
-                    h.set_devtools(dt);
-                }
-                app.comfy_embed_logs
-                    .push_back(format!("DevTools {}", if dt { "enabled" } else { "disabled" }));
-            }
-            if ui.small_button("Open Inspector").clicked() {
-                if let Some(h) = app.comfy_webview.as_mut() {
-                    let ok = h.open_inspector();
-                    app.comfy_embed_logs.push_back(if ok {
-                        "Inspector opened".into()
-                    } else {
-                        "Inspector unavailable; enable DevTools, then right-click → Inspect".into()
-                    });
-                } else {
-                    app.comfy_embed_logs.push_back("Inspector: no embedded view".into());
-                }
-            }
             ui.separator();
             let mut ai = app.comfy_auto_import;
-            if ui.checkbox(&mut ai, "Auto-import outputs").on_hover_text(
-                "Watch ComfyUI output folder and import finished videos into this project",
-            )
-            .changed()
+            if ui
+                .checkbox(&mut ai, "Auto-import outputs")
+                .on_hover_text(
+                    "Watch ComfyUI output folder and import finished videos into this project",
+                )
+                .changed()
             {
                 app.comfy_auto_import = ai;
             }
@@ -364,7 +586,7 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
             .on_hover_text("Commit path to settings")
             .clicked();
         if ui.small_button("Browse…").clicked() {
-            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            if let Some(folder) = app.file_dialog().pick_folder() {
                 app.comfy_repo_input = folder.to_string_lossy().to_string();
             }
         }
@@ -387,7 +609,10 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
         if !dir.is_dir() {
             ui.colored_label(egui::Color32::RED, "Folder does not exist");
         } else if !dir.join("main.py").exists() {
-            ui.colored_label(egui::Color32::YELLOW, "Selected folder does not contain main.py");
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Selected folder does not contain main.py",
+            );
         } else {
             ui.colored_label(egui::Color32::GREEN, "OK");
         }
@@ -404,11 +629,14 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
         ui.label("Host");
         let mut host = app.comfy.config().host.clone();
         if ui.text_edit_singleline(&mut host).changed() {
-            app.comfy.config_mut().host = host;
+            app.comfy.set_host_input(host);
         }
         ui.label("Port");
         let mut p = app.comfy.config().port as i32;
-        if ui.add(egui::DragValue::new(&mut p).clamp_range(1024..=65535)).changed() {
+        if ui
+            .add(egui::DragValue::new(&mut p).clamp_range(1024..=65535))
+            .changed()
+        {
             app.comfy.config_mut().port = p.clamp(1024, 65535) as u16;
         }
         let mut https = app.comfy.config().https;
@@ -429,7 +657,7 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
             ui.label("Install Dir");
             let _ = ui.text_edit_singleline(&mut app.comfy_install_dir_input);
             if ui.small_button("Browse…").clicked() {
-                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                if let Some(folder) = app.file_dialog().pick_folder() {
                     app.comfy_install_dir_input = folder.to_string_lossy().to_string();
                 }
             }
@@ -573,14 +801,15 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
     let running = app.comfy.is_running();
     let repo_dir_valid = {
         let s = app.comfy_repo_input.trim();
-        !s.is_empty()
-            && Path::new(s).is_dir()
-            && Path::new(s).join("main.py").exists()
+        !s.is_empty() && Path::new(s).is_dir() && Path::new(s).join("main.py").exists()
     };
     let py_ok = !app.comfy.config().python_cmd.trim().is_empty();
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(!running && repo_dir_valid && py_ok, egui::Button::new("Start ComfyUI"))
+            .add_enabled(
+                !running && repo_dir_valid && py_ok,
+                egui::Button::new("Start ComfyUI"),
+            )
             .clicked()
         {
             let s = app.comfy_repo_input.trim();
@@ -590,13 +819,12 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
             app.comfy.start();
             if app.comfy_embed_inside && app.comfy_webview.is_none() {
                 if let Some(mut host) = crate::embed_webview::create_platform_host() {
-                    if app.comfy_devtools {
-                        host.set_devtools(true);
-                    }
                     host.navigate(&app.comfy.url());
                     host.set_visible(true);
+                    host.focus();
                     app.comfy_webview = Some(host);
-                    app.comfy_embed_logs.push_back("Embedded view created".into());
+                    app.comfy_embed_logs
+                        .push_back("Embedded view created".into());
                 } else {
                     app.comfy_embed_inside = false;
                     let reason = if !EMBED_WEBVIEW_SUPPORTED {
@@ -604,7 +832,8 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
                     } else {
                         "no NSWindow contentView found; focus the app window and try again"
                     };
-                    app.comfy_embed_logs.push_back(format!("Failed to create embedded view ({})", reason));
+                    app.comfy_embed_logs
+                        .push_back(format!("Failed to create embedded view ({})", reason));
                 }
             }
         }
@@ -619,7 +848,8 @@ pub(super) fn comfy_settings_panel(app: &mut App, ui: &mut egui::Ui) {
             if let Some(mut host) = app.comfy_webview.take() {
                 host.close();
             }
-            app.comfy_embed_logs.push_back("Embedded view closed".into());
+            app.comfy_embed_logs
+                .push_back("Embedded view closed".into());
         }
     });
 
@@ -767,13 +997,25 @@ pub(super) fn cloud_modal_section(app: &mut App, ui: &mut egui::Ui) {
                             }
                         });
                         // Adaptive overall progress
-                        let s_frac = if agg.s_tot > 0 { Some((agg.s_cur as f32) / (agg.s_tot as f32).max(1.0)) } else { None };
-                        let e_frac = if agg.e_tot > 0 { Some((agg.e_cur as f32) / (agg.e_tot as f32).max(1.0)) } else { None };
+                        let s_frac = if agg.s_tot > 0 {
+                            Some((agg.s_cur as f32) / (agg.s_tot as f32).max(1.0))
+                        } else {
+                            None
+                        };
+                        let e_frac = if agg.e_tot > 0 {
+                            Some((agg.e_cur as f32) / (agg.e_tot as f32).max(1.0))
+                        } else {
+                            None
+                        };
                         let overall = match (s_frac, e_frac) {
                             (Some(fs), Some(fe)) => {
-                                if agg.s_cur == 0 && agg.e_cur > 0 { fe }
-                                else if agg.e_cur == 0 && agg.s_cur > 0 { fs }
-                                else { 0.5 * (fs + fe) }
+                                if agg.s_cur == 0 && agg.e_cur > 0 {
+                                    fe
+                                } else if agg.e_cur == 0 && agg.s_cur > 0 {
+                                    fs
+                                } else {
+                                    0.5 * (fs + fe)
+                                }
                             }
                             (Some(fs), None) => fs,
                             (None, Some(fe)) => fe,
@@ -783,18 +1025,20 @@ pub(super) fn cloud_modal_section(app: &mut App, ui: &mut egui::Ui) {
                             ui.add(egui::ProgressBar::new(1.0).text("importing"));
                         } else if overall > 0.0 {
                             let p = overall.clamp(0.0, 1.0);
-                            ui.add(egui::ProgressBar::new(p).text(format!("Overall {:.1}%", p * 100.0)));
+                            ui.add(
+                                egui::ProgressBar::new(p)
+                                    .text(format!("Overall {:.1}%", p * 100.0)),
+                            );
                         } else if let Some((percent, _c, _t, _ts)) = app.modal_job_progress.get(jid)
                         {
                             let p = (*percent / 100.0).clamp(0.0, 1.0);
-                            ui.add(egui::ProgressBar::new(p).text(format!(
-                                "Overall {:.1}%",
-                                *percent
-                            )));
+                            ui.add(
+                                egui::ProgressBar::new(p).text(format!("Overall {:.1}%", *percent)),
+                            );
                         } else {
-                            ui.add(egui::ProgressBar::new(0.01).text(
-                                "Queued / waiting for updates…",
-                            ));
+                            ui.add(
+                                egui::ProgressBar::new(0.01).text("Queued / waiting for updates…"),
+                            );
                         }
                     });
                     ui.add_space(6.0);
@@ -875,29 +1119,12 @@ pub(super) fn comfy_embed_in_assets(app: &mut App, ui: &mut egui::Ui) {
         let running = app.comfy.is_running();
         ui.horizontal(|ui| {
             ui.strong("ComfyUI");
-            ui.add(
-                egui::Slider::new(&mut app.comfy_assets_height, 200.0..=900.0)
-                    .text("Height"),
-            );
+            ui.add(egui::Slider::new(&mut app.comfy_assets_height, 200.0..=900.0).text("Height"));
             ui.separator();
             if ui.small_button("Reload").clicked() {
                 if let Some(h) = app.comfy_webview.as_mut() {
                     h.reload();
                     app.comfy_embed_logs.push_back("Reload requested".into());
-                }
-            }
-            let mut dt = app.comfy_devtools;
-            if ui.checkbox(&mut dt, "DevTools").changed() {
-                app.comfy_devtools = dt;
-                if let Some(h) = app.comfy_webview.as_mut() {
-                    h.set_devtools(dt);
-                }
-                app.comfy_embed_logs
-                    .push_back(format!("DevTools {}", if dt { "enabled" } else { "disabled" }));
-            }
-            if ui.small_button("Inspector").clicked() {
-                if let Some(h) = app.comfy_webview.as_mut() {
-                    let _ = h.open_inspector();
                 }
             }
             if ui.small_button("Browser").clicked() {
@@ -906,21 +1133,19 @@ pub(super) fn comfy_embed_in_assets(app: &mut App, ui: &mut egui::Ui) {
             ui.separator();
             ui.checkbox(&mut app.comfy_auto_import, "Auto-import");
             ui.separator();
-            ui.checkbox(&mut app.comfy_ws_monitor, "Live job monitor").on_hover_text(
-                "Listen to ComfyUI WebSocket and import outputs on job completion",
-            );
+            ui.checkbox(&mut app.comfy_ws_monitor, "Live job monitor")
+                .on_hover_text("Listen to ComfyUI WebSocket and import outputs on job completion");
         });
         ui.separator();
         if running {
             if app.comfy_webview.is_none() {
                 if let Some(mut host) = crate::embed_webview::create_platform_host() {
-                    if app.comfy_devtools {
-                        host.set_devtools(true);
-                    }
                     host.navigate(&app.comfy.url());
                     host.set_visible(true);
+                    host.focus();
                     app.comfy_webview = Some(host);
-                    app.comfy_embed_logs.push_back("Embedded view created (assets)".into());
+                    app.comfy_embed_logs
+                        .push_back("Embedded view created (assets)".into());
                 } else {
                     app.comfy_embed_logs
                         .push_back("Failed to create embedded view (assets)".into());
@@ -928,7 +1153,7 @@ pub(super) fn comfy_embed_in_assets(app: &mut App, ui: &mut egui::Ui) {
             }
             let w = (ui.available_width() - 8.0).max(0.0);
             let size = egui::vec2(w, app.comfy_assets_height);
-            let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
             if let Some(host) = app.comfy_webview.as_mut() {
                 let to_floor = |v: f32| -> i32 { v.floor() as i32 };
                 let to_ceil = |v: f32| -> i32 { v.ceil() as i32 };
@@ -940,7 +1165,11 @@ pub(super) fn comfy_embed_in_assets(app: &mut App, ui: &mut egui::Ui) {
                 };
                 host.set_rect(r);
                 host.set_visible(true);
+                if resp.clicked() || resp.drag_started() {
+                    host.focus();
+                }
             }
+            handle_embedded_comfy_paste(ui, rect, app);
             // height handle
             let hrect = egui::Rect::from_min_size(
                 rect.left_bottom() - egui::vec2(0.0, 6.0),
@@ -957,10 +1186,11 @@ pub(super) fn comfy_embed_in_assets(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 egui::Stroke::new(1.0, egui::Color32::from_gray(150))
             };
-            ui.painter().line_segment([hrect.left_center(), hrect.right_center()], stroke);
+            ui.painter()
+                .line_segment([hrect.left_center(), hrect.right_center()], stroke);
             if hresp.dragged() {
-                app.comfy_assets_height = (app.comfy_assets_height + hresp.drag_delta().y)
-                    .clamp(200.0, 900.0);
+                app.comfy_assets_height =
+                    (app.comfy_assets_height + hresp.drag_delta().y).clamp(200.0, 900.0);
             }
             ui.separator();
         } else {
@@ -971,87 +1201,172 @@ pub(super) fn comfy_embed_in_assets(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-pub(super) fn assets_scroll_section(app: &mut App, ui: &mut egui::Ui) {
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        // Compact assets grid
-        let assets = app.assets();
-        if assets.is_empty() {
-            ui.small("No assets in this project yet. Use Import… to add media.");
-        } else {
-            let cell = 80.0f32; // fixed square thumbnails
-            let card_w = cell + 4.0; // small horizontal gap
-            let cols = (ui.available_width() / card_w).floor().max(1.0) as usize;
-            egui::Grid::new("assets_grid")
-                .num_columns(cols)
-                .spacing([2.0, 8.0])
-                .show(ui, |ui| {
-                    for (i, a) in assets.iter().enumerate() {
-                        ui.vertical(|ui| {
-                            // Square slot
-                            let (r, resp) = ui.allocate_exact_size(
-                                egui::vec2(cell, cell),
-                                egui::Sense::click_and_drag(),
-                            );
-                            // Paint image (contained inside square) or placeholder
-                            if let Some(tex) = app.load_thumb_texture(ui.ctx(), a, cell as u32, cell as u32) {
-                                // Contain inside square based on asset or texture aspect
-                                let (dw, dh) = match (a.width, a.height) {
-                                    (Some(w), Some(h)) if w > 0 && h > 0 => {
-                                        let aspect = w as f32 / h as f32;
-                                        if aspect >= 1.0 { (cell, (cell / aspect).max(1.0)) } else { (cell * aspect, cell) }
-                                    }
-                                    _ => {
-                                        // Fallback assume 16:9
-                                        let aspect = 16.0 / 9.0;
-                                        (cell, (cell / aspect).max(1.0))
-                                    }
-                                };
-                                let img_rect = egui::Rect::from_center_size(r.center(), egui::vec2(dw, dh));
-                                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                                ui.painter().image(tex.id(), img_rect, uv, egui::Color32::WHITE);
-                                ui.painter().rect_stroke(r, 4.0, egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
-                            } else {
-                                // Placeholder card
-                                ui.painter().rect_filled(r, 6.0, egui::Color32::from_rgb(60, 66, 82));
-                                // Initial letter overlay
-                                let name = std::path::Path::new(&a.src_abs)
-                                    .file_stem()
-                                    .map(|s| s.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| a.src_abs.clone());
-                                let ch = name.chars().next().unwrap_or('?');
-                                ui.painter().text(
-                                    r.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    ch,
-                                    egui::FontId::proportional(28.0),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-                            // Interactions
-                            if resp.drag_started() { app.dragging_asset = Some(a.clone()); }
-                            if resp.clicked() { app.add_asset_to_timeline(a); }
-                            ui.add_space(2.0);
-                            let name = std::path::Path::new(&a.src_abs)
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| a.src_abs.clone());
-                            let lbl = egui::Label::new(egui::RichText::new(name).small());
-                            ui.add_sized([cell, 14.0], lbl);
-                            ui.small(&a.kind);
-                        });
-                        if (i + 1) % cols == 0 { ui.end_row(); }
+fn handle_embedded_comfy_paste(ui: &egui::Ui, rect: egui::Rect, app: &mut App) {
+    let mut paste_text: Option<String> = None;
+    let mut paste_requested = false;
+    ui.ctx().input(|input| {
+        for event in &input.events {
+            if let egui::Event::Paste(text) = event {
+                if let Some(pos) = input.pointer.latest_pos() {
+                    if rect.contains(pos) {
+                        paste_text = Some(text.clone());
+                        break;
                     }
-                    // Ensure the last row ends
-                    if assets.len() % cols != 0 { ui.end_row(); }
-                });
+                } else {
+                    paste_text = Some(text.clone());
+                    break;
+                }
+            }
+            if let egui::Event::Key {
+                key: egui::Key::V,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                let command_only =
+                    modifiers.command && !modifiers.ctrl && !modifiers.alt && !modifiers.shift;
+                let ctrl_only =
+                    modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift;
+                if command_only || ctrl_only {
+                    if let Some(pos) = input.pointer.latest_pos() {
+                        if rect.contains(pos) {
+                            paste_requested = true;
+                            break;
+                        }
+                    } else {
+                        paste_requested = true;
+                        break;
+                    }
+                }
+            }
         }
-        ui.separator();
-        ui.collapsing("Native Video Decoder", |ui| {
-            let available = native_decoder::is_native_decoding_available();
-            ui.label(format!(
-                "Native decoding available: {}",
-                if available { "✅ Yes" } else { "❌ No" }
-            ));
+    });
+    if let Some(text) = paste_text {
+        if let Some(host) = app.comfy_webview.as_mut() {
+            host.focus();
+            host.insert_text(&text);
+        }
+    } else if paste_requested {
+        if let Some(host) = app.comfy_webview.as_mut() {
+            host.focus();
+            host.paste_from_clipboard();
+        }
+    }
+}
+
+pub(super) fn assets_scroll_section(app: &mut App, ui: &mut egui::Ui, assets: &[AssetRow]) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if assets.is_empty() {
+                ui.small("No assets in this project yet. Use Import… to add media.");
+            } else {
+                let cell = 80.0f32; // fixed square thumbnails
+                let card_w = cell + 4.0; // small horizontal gap
+                let cols = (ui.available_width() / card_w).floor().max(1.0) as usize;
+                egui::Grid::new("assets_grid")
+                    .num_columns(cols)
+                    .spacing([2.0, 8.0])
+                    .show(ui, |ui| {
+                        for (i, a) in assets.iter().enumerate() {
+                            ui.vertical(|ui| {
+                                // Square slot
+                                let (r, resp) = ui.allocate_exact_size(
+                                    egui::vec2(cell, cell),
+                                    egui::Sense::click_and_drag(),
+                                );
+                                // Paint image (contained inside square) or placeholder
+                                if let Some(tex) =
+                                    app.load_thumb_texture(ui.ctx(), a, cell as u32, cell as u32)
+                                {
+                                    // Contain inside square based on asset or texture aspect
+                                    let (dw, dh) = match (a.width, a.height) {
+                                        (Some(w), Some(h)) if w > 0 && h > 0 => {
+                                            let aspect = w as f32 / h as f32;
+                                            if aspect >= 1.0 {
+                                                (cell, (cell / aspect).max(1.0))
+                                            } else {
+                                                (cell * aspect, cell)
+                                            }
+                                        }
+                                        _ => {
+                                            // Fallback assume 16:9
+                                            let aspect = 16.0 / 9.0;
+                                            (cell, (cell / aspect).max(1.0))
+                                        }
+                                    };
+                                    let img_rect = egui::Rect::from_center_size(
+                                        r.center(),
+                                        egui::vec2(dw, dh),
+                                    );
+                                    let uv = egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    );
+                                    ui.painter().image(
+                                        tex.id(),
+                                        img_rect,
+                                        uv,
+                                        egui::Color32::WHITE,
+                                    );
+                                    ui.painter().rect_stroke(
+                                        r,
+                                        4.0,
+                                        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+                                    );
+                                } else {
+                                    // Placeholder card
+                                    ui.painter().rect_filled(
+                                        r,
+                                        6.0,
+                                        egui::Color32::from_rgb(60, 66, 82),
+                                    );
+                                    // Initial letter overlay
+                                    let name = std::path::Path::new(&a.src_abs)
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| a.src_abs.clone());
+                                    let ch = name.chars().next().unwrap_or('?');
+                                    ui.painter().text(
+                                        r.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        ch,
+                                        egui::FontId::proportional(28.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                                // Interactions
+                                if resp.drag_started() {
+                                    app.dragging_asset = Some(a.clone());
+                                }
+                                if resp.clicked() {
+                                    app.add_asset_to_timeline(a);
+                                }
+                                ui.add_space(2.0);
+                                proxy_status_badge(ui, app, a, cell);
+                                let name = asset_display_name(a);
+                                let lbl = egui::Label::new(egui::RichText::new(name).small());
+                                ui.add_sized([cell, 14.0], lbl);
+                                ui.small(&a.kind);
+                            });
+                            if (i + 1) % cols == 0 {
+                                ui.end_row();
+                            }
+                        }
+                        // Ensure the last row ends
+                        if assets.len() % cols != 0 {
+                            ui.end_row();
+                        }
+                    });
+            }
+            ui.separator();
+            ui.collapsing("Native Video Decoder", |ui| {
+                let available = native_decoder::is_native_decoding_available();
+                ui.label(format!(
+                    "Native decoding available: {}",
+                    if available { "✅ Yes" } else { "❌ No" }
+                ));
 
                 if available {
                     ui.label("• VideoToolbox hardware acceleration");
@@ -1059,7 +1374,7 @@ pub(super) fn assets_scroll_section(app: &mut App, ui: &mut egui::Ui) {
                     ui.label("• Phase 2: Zero-copy IOSurface (planned)");
 
                     if ui.button("Test Native Decoder (Phase 1)").clicked() {
-                        if let Some(asset) = app.assets().first() {
+                        if let Some(asset) = assets.first() {
                             let config = native_decoder::DecoderConfig {
                                 hardware_acceleration: true,
                                 preferred_format: Some(native_decoder::YuvPixFmt::Nv12),
@@ -1081,10 +1396,7 @@ pub(super) fn assets_scroll_section(app: &mut App, ui: &mut egui::Ui) {
                                             "✅ Frame decoded: {}x{} YUV",
                                             frame.width, frame.height
                                         ));
-                                        ui.label(format!(
-                                            "Y plane: {} bytes",
-                                            frame.y_plane.len()
-                                        ));
+                                        ui.label(format!("Y plane: {} bytes", frame.y_plane.len()));
                                         ui.label(format!(
                                             "UV plane: {} bytes",
                                             frame.uv_plane.len()
@@ -1094,10 +1406,7 @@ pub(super) fn assets_scroll_section(app: &mut App, ui: &mut egui::Ui) {
                                     }
                                 }
                                 Err(e) => {
-                                    ui.label(format!(
-                                        "❌ Decoder creation failed: {}",
-                                        e
-                                    ));
+                                    ui.label(format!("❌ Decoder creation failed: {}", e));
                                 }
                             }
                         } else {
@@ -1105,11 +1414,8 @@ pub(super) fn assets_scroll_section(app: &mut App, ui: &mut egui::Ui) {
                         }
                     }
 
-                    if ui
-                        .button("Test Zero-Copy Decoder (Phase 2)")
-                        .clicked()
-                    {
-                        if let Some(asset) = app.assets().first() {
+                    if ui.button("Test Zero-Copy Decoder (Phase 2)").clicked() {
+                        if let Some(asset) = assets.first() {
                             let config = native_decoder::DecoderConfig {
                                 hardware_acceleration: true,
                                 preferred_format: Some(native_decoder::YuvPixFmt::Nv12),
@@ -1135,8 +1441,7 @@ pub(super) fn assets_scroll_section(app: &mut App, ui: &mut egui::Ui) {
                                         {
                                             ui.label(format!(
                                                 "✅ IOSurface frame decoded: {}x{}",
-                                                iosurface_frame.width,
-                                                iosurface_frame.height
+                                                iosurface_frame.width, iosurface_frame.height
                                             ));
                                             ui.label(format!(
                                                 "Surface format: {:?}",
@@ -1174,8 +1479,103 @@ pub(super) fn assets_scroll_section(app: &mut App, ui: &mut egui::Ui) {
                     ui.label("Native decoding not available on this platform");
                     ui.label("Falling back to FFmpeg-based decoding");
                 }
+            });
         });
-    });
+}
+
+fn proxy_status_badge(ui: &mut egui::Ui, app: &App, asset: &AssetRow, width: f32) {
+    if !asset.kind.eq_ignore_ascii_case("video") {
+        return;
+    }
+    if let Some(status) = app.proxy_status.get(&asset.id) {
+        match status {
+            ProxyStatus::Pending => {
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .desired_width(width)
+                        .text("Proxy pending…"),
+                );
+            }
+            ProxyStatus::Running { progress } => {
+                let pct = progress.clamp(0.0, 1.0);
+                ui.add(
+                    egui::ProgressBar::new(pct)
+                        .desired_width(width)
+                        .show_percentage()
+                        .text(format!("Proxy {:.0}%", pct * 100.0)),
+                );
+            }
+            ProxyStatus::Failed { message } => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("Proxy failed: {}", message),
+                );
+            }
+            ProxyStatus::Completed { .. } => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_GREEN,
+                    egui::RichText::new("Proxy ready").small(),
+                );
+            }
+        }
+        return;
+    }
+    if asset.is_proxy_ready {
+        ui.colored_label(
+            egui::Color32::LIGHT_GREEN,
+            egui::RichText::new("Proxy ready").small(),
+        );
+    }
+}
+
+fn asset_display_name(asset: &AssetRow) -> String {
+    Path::new(&asset.src_abs)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| asset.src_abs.clone())
+}
+
+fn describe_proxy_preset(preset: &str) -> &'static str {
+    match preset {
+        "mac_prores" => "ProRes Proxy",
+        "dnxhr_lb" => "DNxHR LB",
+        _ => "Unknown",
+    }
+}
+
+fn describe_proxy_codec(preset: &str) -> &'static str {
+    match preset {
+        "mac_prores" => "Apple ProRes (Proxy)",
+        "dnxhr_lb" => "Avid DNxHR LB",
+        _ => "Unknown",
+    }
+}
+
+fn describe_proxy_container(_preset: &str) -> &'static str {
+    "QuickTime MOV"
+}
+
+fn describe_proxy_reason(reason: &str) -> String {
+    match reason {
+        "import" => "Import".to_string(),
+        "timeline" => "Timeline".to_string(),
+        "playback_lag" => "Playback Lag".to_string(),
+        "manual" => "Manual".to_string(),
+        "mode" => "Proxy Mode".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn format_proxy_job_timestamp(completed_at: Option<i64>, updated_at: i64) -> Option<String> {
+    let (label, ts) = if let Some(done) = completed_at {
+        ("Completed", done)
+    } else {
+        ("Updated", updated_at)
+    };
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| format!("{}: {}", label, dt.format("%Y-%m-%d %H:%M:%S")))
 }
 
 pub(super) fn properties_panel(app: &mut App, ctx: &egui::Context) {
@@ -1186,8 +1586,22 @@ pub(super) fn properties_panel(app: &mut App, ctx: &egui::Context) {
             if let Some((ti, ii)) = app.selected {
                 if ti < app.seq.tracks.len() && ii < app.seq.tracks[ti].items.len() {
                     let item = &mut app.seq.tracks[ti].items[ii];
+                    let clip_type_label = match &item.kind {
+                        super::timeline_crate::ItemKind::Video { .. } => "Video",
+                        super::timeline_crate::ItemKind::Image { .. } => "Image",
+                        super::timeline_crate::ItemKind::Audio { .. } => "Audio",
+                        super::timeline_crate::ItemKind::Text { .. } => "Text",
+                        super::timeline_crate::ItemKind::Solid { .. } => "Solid",
+                    };
                     ui.label(format!("Clip ID: {}", &item.id[..8.min(item.id.len())]));
+                    ui.label(format!("Type: {}", clip_type_label));
                     ui.label(format!("From: {}  Dur: {}f", item.from, item.duration_in_frames));
+                    let asset_src = match &item.kind {
+                        super::timeline_crate::ItemKind::Video { src, .. } => Some(src.clone()),
+                        super::timeline_crate::ItemKind::Image { src } => Some(src.clone()),
+                        super::timeline_crate::ItemKind::Audio { src, .. } => Some(src.clone()),
+                        _ => None,
+                    };
                     match &mut item.kind {
                         super::timeline_crate::ItemKind::Video { in_offset_sec, rate, .. } => {
                             let mut pending_rate: Option<f32> = None;
@@ -1248,7 +1662,259 @@ pub(super) fn properties_panel(app: &mut App, ctx: &egui::Context) {
                             ui.separator();
                             ui.label("Image clip has no time controls");
                         }
+                        super::timeline_crate::ItemKind::Audio { .. } => {}
                         _ => {}
+                    }
+                    let mut asset_row: Option<AssetRow> = None;
+                    let mut comfy_meta: Option<serde_json::Value> = None;
+                    if let Some(src) = asset_src.as_deref() {
+                        if let Ok(Some(asset)) = app.db.find_asset_by_path(&app.project_id, src) {
+                            if let Some(meta_str) = asset.metadata_json.as_deref() {
+                                let trimmed = meta_str.trim();
+                                if !trimmed.is_empty() && trimmed != "null" {
+                                    comfy_meta = serde_json::from_str(trimmed).ok();
+                                }
+                            }
+                            asset_row = Some(asset);
+                        }
+                    }
+                    if let Some(asset) = asset_row.as_ref() {
+                        ui.separator();
+                        ui.label(RichText::new("Media").strong());
+                        ui.label(format!("Source Kind: {}", asset.kind));
+                        if let Some(path) = asset_src.as_ref() {
+                            ui.label(format!("Path: {}", path));
+                        }
+                        if let (Some(w), Some(h)) = (asset.width, asset.height) {
+                            ui.label(format!("Dimensions: {}x{}", w, h));
+                        }
+                        if let (Some(num), Some(den)) = (asset.fps_num, asset.fps_den) {
+                            if num > 0 && den > 0 {
+                                let fps = num as f64 / den as f64;
+                                ui.label(format!("Frame rate: {:.3} fps ({} / {})", fps, num, den));
+                            }
+                        }
+                        if let Some(frames) = asset.duration_frames {
+                            ui.label(format!("Duration: {} frames", frames));
+                            if let Some(sec) = asset.duration_seconds() {
+                                ui.label(format!("Duration (s): {:.3}", sec));
+                            }
+                        }
+                        if let Some(rate) = asset.sample_rate {
+                            ui.label(format!("Sample rate: {} Hz", rate));
+                        }
+                        if let Some(ch) = asset.audio_channels {
+                            ui.label(format!("Audio channels: {}", ch));
+                        }
+                        if let Some(proxy_path) = asset.proxy_path.as_deref() {
+                            ui.label(format!("Proxy Path: {}", proxy_path));
+                        }
+
+                        ui.separator();
+                        ui.label(RichText::new("Proxy").strong());
+                        let status_label = app
+                            .proxy_status
+                            .get(&asset.id)
+                            .map(|status| match status {
+                                ProxyStatus::Pending => "Pending".to_string(),
+                                ProxyStatus::Running { progress } => format!(
+                                    "Running ({:.0}%)",
+                                    (progress * 100.0).clamp(0.0, 100.0)
+                                ),
+                                ProxyStatus::Completed { .. } => "Completed".to_string(),
+                                ProxyStatus::Failed { .. } => "Failed".to_string(),
+                            })
+                            .or_else(|| {
+                                if asset.is_proxy_ready {
+                                    Some("Ready".to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| "Not generated".to_string());
+                        ui.label(format!("Status: {}", status_label));
+
+                        let proxy_running = matches!(
+                            app.proxy_status.get(&asset.id),
+                            Some(ProxyStatus::Pending | ProxyStatus::Running { .. })
+                        );
+                        let button_label = if asset.is_proxy_ready {
+                            "Regenerate Proxy"
+                        } else {
+                            "Generate Proxy"
+                        };
+                        let button_enabled = app.proxy_queue.is_some() && !proxy_running;
+                        if ui
+                            .add_enabled(button_enabled, egui::Button::new(button_label))
+                            .clicked()
+                        {
+                            app.queue_proxy_for_asset(asset, ProxyReason::Manual, true);
+                        }
+                        if asset.is_proxy_ready {
+                            if ui
+                                .add_enabled(
+                                    !proxy_running,
+                                    egui::Button::new("Delete Proxy"),
+                                )
+                                .clicked()
+                            {
+                                app.delete_proxy_for_asset(asset);
+                            }
+                        }
+                        let proxy_forced = app.is_proxy_preview_forced(&asset.id);
+                        let force_label = if proxy_forced {
+                            "Preview Original Clip"
+                        } else {
+                            "Preview Proxy Clip"
+                        };
+                        let mut force_button = ui.add_enabled(
+                            asset.is_proxy_ready || proxy_forced,
+                            egui::Button::new(force_label),
+                        );
+                        if !asset.is_proxy_ready && !proxy_forced {
+                            force_button =
+                                force_button.on_hover_text("Proxy not ready yet for preview");
+                        }
+                        if force_button.clicked() {
+                            if proxy_forced {
+                                app.restore_original_preview_for_asset(&asset.id);
+                            } else {
+                                app.force_proxy_preview_for_asset(asset);
+                            }
+                        }
+                        let proxy_job_details = app
+                            .db
+                            .find_latest_proxy_job_for_asset(&asset.id)
+                            .ok()
+                            .flatten();
+                        if let Some(job) = proxy_job_details {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Proxy Details").strong());
+                            ui.label(format!(
+                                "Preset: {}",
+                                describe_proxy_preset(&job.preset)
+                            ));
+                            ui.label(format!(
+                                "Codec: {}",
+                                describe_proxy_codec(&job.preset)
+                            ));
+                            ui.label(format!(
+                                "Container: {}",
+                                describe_proxy_container(&job.preset)
+                            ));
+                            if let (Some(w), Some(h)) = (job.width, job.height) {
+                                if w > 0 && h > 0 {
+                                    ui.label(format!("Target Resolution: {}x{}", w, h));
+                                }
+                            }
+                            if let Some(kbps) = job.bitrate_kbps {
+                                if kbps > 0 {
+                                    ui.label(format!(
+                                        "Target Bitrate: {:.1} Mbps",
+                                        kbps as f64 / 1000.0
+                                    ));
+                                }
+                            }
+                            if let Some(reason) = job.reason.as_deref() {
+                                ui.label(format!(
+                                    "Last Job Reason: {}",
+                                    describe_proxy_reason(reason)
+                                ));
+                            }
+                            ui.label(format!("Last Job Status: {}", job.status));
+                            if let Some(labelled_time) = format_proxy_job_timestamp(
+                                job.completed_at,
+                                job.updated_at,
+                            ) {
+                                ui.label(labelled_time);
+                            }
+                        }
+                        if proxy_running {
+                            ui.weak("Proxy job currently running…");
+                        } else if app.proxy_queue.is_none() {
+                            ui.weak("Proxy queue unavailable.");
+                        } else if asset.is_proxy_ready {
+                            ui.weak("Proxy ready; regenerate if media changed.");
+                        }
+
+                        let log_entries = app.proxy_logs.get(&asset.id).cloned();
+                        ui.add_space(4.0);
+                        ui.label("Logs");
+                        ScrollArea::vertical()
+                            .max_height(140.0)
+                            .id_source(format!("proxy_logs_{}", asset.id))
+                            .show(ui, move |ui| {
+                                if let Some(entries) = log_entries {
+                                    if entries.is_empty() {
+                                        ui.weak("No proxy activity yet.");
+                                    } else {
+                                        for entry in entries.iter().rev() {
+                                            ui.label(entry);
+                                        }
+                                    }
+                                } else {
+                                    ui.weak("No proxy activity yet.");
+                                }
+                            });
+                    }
+                    if let Some(meta) = comfy_meta.as_ref() {
+                        if meta
+                            .get("source")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s == "comfy_storyboard")
+                            .unwrap_or(false)
+                        {
+                            ui.separator();
+                            ui.label(RichText::new("Storyboard").strong());
+                            if let Some(title) = meta.get("card_title").and_then(|v| v.as_str()) {
+                                ui.label(format!("Card: {}", title));
+                            }
+                            if let Some(workflow) =
+                                meta.get("workflow_name").and_then(|v| v.as_str())
+                            {
+                                ui.label(format!("Workflow: {}", workflow));
+                            }
+                            if let Some(queued) = meta.get("queued_at").and_then(|v| v.as_str()) {
+                                ui.label(format!("Queued: {}", queued));
+                            }
+                            if let Some(completed) =
+                                meta.get("completed_at").and_then(|v| v.as_str())
+                            {
+                                ui.label(format!("Completed: {}", completed));
+                            }
+                            if let Some(desc) = meta
+                                .get("card_description")
+                                .and_then(|v| v.as_str())
+                            {
+                                if !desc.trim().is_empty() {
+                                    ui.label("Description:");
+                                    ui.label(desc);
+                                }
+                            }
+                            if let Some(inputs) =
+                                meta.get("workflow_inputs").and_then(|v| v.as_object())
+                            {
+                                if !inputs.is_empty() {
+                                    ui.collapsing("Workflow Inputs", |ui| {
+                                        let mut keys: Vec<_> = inputs.keys().collect();
+                                        keys.sort();
+                                        for key in keys {
+                                            let value = &inputs[key];
+                                            if let Some(text) = value.as_str() {
+                                                ui.label(format!("{}: {}", key, text));
+                                            } else {
+                                                ui.label(format!("{}: {}", key, value));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        } else {
+                            ui.separator();
+                            ui.collapsing("Metadata", |ui| {
+                                ui.label(meta.to_string());
+                            });
+                        }
                     }
                 } else {
                     ui.label("Selection out of range");
@@ -1314,40 +1980,48 @@ pub(super) fn center_editor(app: &mut App, ctx: &egui::Context, frame: &mut efra
                     kind: timeline_crate::TrackKind::Audio,
                     node_ids: Vec::new(),
                 };
-                let _ = app.apply_timeline_command(timeline_crate::TimelineCommand::UpsertTrack { track: binding });
+                let _ = app.apply_timeline_command(timeline_crate::TimelineCommand::UpsertTrack {
+                    track: binding,
+                });
                 let _ = app.save_project_timeline();
             }
             if ui.small_button("− Last Video").clicked() {
-                if let Some((_idx, id)) = app
-                    .seq
-                    .graph
-                    .tracks
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find_map(|(_i, t)| match t.kind {
-                        timeline_crate::TrackKind::Video => Some((_i, t.id)),
-                        _ => None,
-                    })
+                if let Some((_idx, id)) =
+                    app.seq
+                        .graph
+                        .tracks
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(_i, t)| match t.kind {
+                            timeline_crate::TrackKind::Video => Some((_i, t.id)),
+                            _ => None,
+                        })
                 {
-                    let _ = app.apply_timeline_command(timeline_crate::TimelineCommand::RemoveTrack { track_id: id });
+                    let _ =
+                        app.apply_timeline_command(timeline_crate::TimelineCommand::RemoveTrack {
+                            track_id: id,
+                        });
                     let _ = app.save_project_timeline();
                 }
             }
             if ui.small_button("− Last Audio").clicked() {
-                if let Some((_idx, id)) = app
-                    .seq
-                    .graph
-                    .tracks
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find_map(|(_i, t)| match t.kind {
-                        timeline_crate::TrackKind::Audio => Some((_i, t.id)),
-                        _ => None,
-                    })
+                if let Some((_idx, id)) =
+                    app.seq
+                        .graph
+                        .tracks
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(_i, t)| match t.kind {
+                            timeline_crate::TrackKind::Audio => Some((_i, t.id)),
+                            _ => None,
+                        })
                 {
-                    let _ = app.apply_timeline_command(timeline_crate::TimelineCommand::RemoveTrack { track_id: id });
+                    let _ =
+                        app.apply_timeline_command(timeline_crate::TimelineCommand::RemoveTrack {
+                            track_id: id,
+                        });
                     let _ = app.save_project_timeline();
                 }
             }
@@ -1386,7 +2060,10 @@ pub(super) fn drag_overlay(app: &mut App, ctx: &egui::Context) {
             ));
             let thumb_w = app.asset_thumb_w.min(200.0).max(80.0);
             let thumb_h = thumb_w / 16.0 * 9.0;
-            let rect = egui::Rect::from_center_size(pos + egui::vec2(0.0, -thumb_h / 2.0), egui::vec2(thumb_w, thumb_h));
+            let rect = egui::Rect::from_center_size(
+                pos + egui::vec2(0.0, -thumb_h / 2.0),
+                egui::vec2(thumb_w, thumb_h),
+            );
             painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(128));
             painter.text(
                 rect.center(),

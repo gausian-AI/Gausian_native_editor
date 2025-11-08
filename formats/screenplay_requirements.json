@@ -1,0 +1,54 @@
+{
+  "screenplay_requirements": {
+    "core_metadata": {
+      "title": "string - title of the screenplay or project",
+      "genre": "string - main genre (e.g., thriller, drama, sci-fi)",
+      "duration_minutes": "number - target runtime or length in minutes",
+      "synopsis": "string - one to two sentence summary or logline"
+    },
+    "narrative_context": {
+      "setting": "string - description of time and place (e.g., near-future Seoul, 2040)",
+      "main_characters": [
+        {
+          "name": "string - character name",
+          "description": "string - short bio, traits, motivations"
+        }
+      ],
+      "tone": "string - emotional or stylistic tone (e.g., dark, hopeful, surreal)",
+      "theme": "string - underlying moral, idea, or philosophical concept"
+    },
+    "structure_outline": {
+      "acts": [
+        {
+          "id": "integer - act number",
+          "title": "string - title or description (e.g., Act I – The Setup)",
+          "summary": "string - 1-2 sentences describing act purpose",
+          "beats": ["string - list of narrative beats or major turning points"]
+        }
+      ],
+      "scene_list": [
+        {
+          "id": "integer - sequential scene ID",
+          "title": "string - scene title",
+          "summary": "string - one-line scene purpose or description"
+        }
+      ]
+    },
+    "visual_storytelling": {
+      "style": "string - general cinematic style (e.g., noir, documentary, stylized)",
+      "color_palette": "string - visual tone or palette (optional)",
+      "camera_approach": "string - overall camera language (static, handheld, cinematic)"
+    },
+    "generation_parameters": {
+      "draft_scope": "string - what to generate (outline, first act, full draft)",
+      "format": "string - desired output format (e.g., Fountain, screenplay JSON)",
+      "model_role": "string - instruction for the LLM (e.g., 'Act as a professional screenwriter')",
+      "continuation_policy": "string - whether to generate all scenes or step-by-step"
+    },
+    "optional_additions": {
+      "music_tone": "string - mood or soundtrack reference",
+      "visual_references": ["string - reference films, shows, or styles"],
+      "production_notes": "string - director or producer’s specific goals"
+    }
+  }
+}
