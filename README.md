@@ -36,6 +36,8 @@
 
 Gausian is a native editor focused on snappy preview, practical timeline tools, and smooth ingest/export. It supports hardware decoding (VideoToolbox on macOS, GStreamer pipelines cross‑platform), a WGPU preview pipeline, and integrates with a local ComfyUI for prompt‑based generation via an embedded WebView and auto‑import of outputs. A CLI is included for headless operations.
 
+![GitHub contributors](https://img.shields.io/github/contributors/OWNER/REPO)
+
 ## ✨ Features
 
 - GPU-accelerated preview (WGPU) with YUV→RGB shaders and readback
