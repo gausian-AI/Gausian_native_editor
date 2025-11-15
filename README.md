@@ -38,7 +38,7 @@ Gausian is a native editor focused on snappy preview, practical timeline tools, 
 
 ## 👥 Contributors
 
-[![Contributors](https://contrib.rocks/image?repo=gausian-AI/Gausian_native_editor)](https://github.com/gausian-AI/Gausian_native_editor/graphs/contributors)
+[![Contributors](https://contrib.rocks/image?repo=gausian-AI/Gausian_native_editor)](https://github.com/mAengo31)
 
 ## ✨ Features
 
