@@ -49,6 +49,7 @@ Gausian is a native editor focused on snappy preview, practical timeline tools, 
 - Proxy generation via GStreamer (ProRes/NVENC/VAAPI/software)
 - Local ComfyUI: optional embedded WebView and auto‑import from a local ComfyUI output folder
 - Screenplay/Storyboard helpers with LLM providers (OpenAI, etc.)
+- Footage analysis with Twelve Labs Pegasus (opt‑in): describe, summarise, or shot‑list a clip from a URL or asset
 - Cross-platform desktop (macOS/Windows/Linux)
 
 ## 🚀 Getting Started
@@ -131,6 +132,35 @@ Basic flow
 - Export: choose preset; FCPXML/FCP7/EDL/JSON also available
 - ComfyUI (local): set Repo Path, enable auto‑import to ingest outputs
   - Note: only local ComfyUI is supported at this time; no remote/cloud connection
+
+## 🎬 Footage Analysis (Twelve Labs Pegasus)
+
+Optional, opt‑in AI footage understanding for video production. Given a clip
+(a direct media URL or an uploaded Twelve Labs asset) and a prompt, the
+[Twelve Labs](https://twelvelabs.io) Pegasus model returns a textual analysis —
+useful for auto‑describing footage, summarising a take, or generating a shot
+list. Nothing here runs unless you call it explicitly with an API key, so it
+does not affect any existing behaviour.
+
+```rust
+use desktop::footage_analysis::{FootageAnalyzer, PegasusConfig, VideoSource};
+
+let analyzer = FootageAnalyzer::new(PegasusConfig::new(std::env::var("TWELVELABS_API_KEY")?))?;
+let result = analyzer.analyze(
+    VideoSource::url("https://example.com/clip.mp4"),
+    "Summarise the action and list every distinct shot.",
+)?;
+println!("{}", result.text);
+```
+
+The integration test exercises a real Pegasus call and is skipped unless a key
+is present:
+
+```bash
+TWELVELABS_API_KEY=tlk_... cargo test -p desktop --test footage_analysis_tests -- --nocapture
+```
+
+You can grab a free API key at https://twelvelabs.io — there's a generous free tier.
 
 ## 🛠 CLI
 
